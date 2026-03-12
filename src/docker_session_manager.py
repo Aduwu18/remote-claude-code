@@ -57,6 +57,11 @@ class DockerSessionManager:
         # 读取容器内的配置
         authorized_users = self.read_container_settings(container_name)
 
+        # 创建者自动成为授权用户
+        if user_open_id not in authorized_users:
+            authorized_users.append(user_open_id)
+            logger.info(f"创建者 {user_open_id[:8]}... 已加入授权用户列表")
+
         conn = _get_conn()
         conn.execute("""
             INSERT OR REPLACE INTO docker_sessions

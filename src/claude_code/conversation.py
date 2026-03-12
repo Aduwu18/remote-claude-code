@@ -27,16 +27,26 @@ class ChatResponse:
 
 SYSTEM_PROMPT = """你是一个强大的本地电脑助手，拥有完整的系统操作权限。
 
-## Docker 容器会话
+## Docker 容器会话（重要！）
 
-当用户想要进入或操作 Docker 容器时，使用 create_docker_session 工具创建容器专属会话。
+**当用户想要进入或操作 Docker 容器时，你必须调用 create_docker_session 工具，而不是使用 Bash 执行 docker exec。**
 
-例如用户说：
+用户意图示例：
 - "进入 xxx 容器"
 - "连接到 xxx 容器"
 - "我要操作 xxx 容器"
+- "在 xxx 容器里执行..."
 
-请调用 create_docker_session 工具，参数为容器名称。
+**正确做法：**
+1. 调用 create_docker_session 工具，参数为容器名称
+2. 等待用户确认
+3. 用户确认后，系统会创建新的私聊窗口用于容器操作
+
+**错误做法：**
+- 不要使用 Bash 执行 `docker exec` 命令
+- 不要直接在容器内执行命令
+
+只有 create_docker_session 工具才能正确创建容器专属会话。
 
 ## 你的能力
 
@@ -175,7 +185,10 @@ class ConversationClient:
         self.session_id: Optional[str] = session_id
         self.chat_id = chat_id
         self.user_open_id = user_open_id
-        self.allowed_tools = allowed_tools or ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+        self.allowed_tools = allowed_tools or [
+            "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+            "mcp__docker__create_docker_session"  # Docker 容器会话创建工具
+        ]
         self.permission_mode = permission_mode
         self.container = container
         self.require_confirmation = require_confirmation
@@ -196,12 +209,20 @@ class ConversationClient:
             from src.docker_mcp import get_docker_mcp_server
             mcp_servers = {"docker": get_docker_mcp_server()}
 
+        # 通过环境变量传递上下文（用于 MCP 工具）
+        env_vars = {}
+        if self.chat_id:
+            env_vars["MCP_CHAT_ID"] = self.chat_id
+        if self.user_open_id:
+            env_vars["MCP_USER_OPEN_ID"] = self.user_open_id
+
         options = ClaudeAgentOptions(
             resume=self._initial_session_id,
             allowed_tools=self.allowed_tools,
             permission_mode=self.permission_mode,
             system_prompt={"type": "preset", "preset": "claude_code", "append": self.system_prompt},
             mcp_servers=mcp_servers,
+            env=env_vars if env_vars else None,
         )
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()
@@ -274,7 +295,9 @@ class ConversationClient:
             return True  # 没有关联聊天，默认允许
 
         # 某些工具不需要确认
-        safe_tools = ["Read", "Glob", "Grep"]
+        # - Read/Glob/Grep: 只读操作，安全
+        # - mcp__docker__create_docker_session: Docker 会话创建有自己的确认流程
+        safe_tools = ["Read", "Glob", "Grep", "mcp__docker__create_docker_session"]
         if tool_name in safe_tools:
             return True
 
@@ -342,11 +365,16 @@ def chat_sync(
         reply, session_id = chat_sync("ls /app", container="mycontainer")
     """
     import concurrent.futures
+    from src.context import set_request_context, clear_request_context
 
     def _run_in_thread():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
+            # 在新线程中重新设置上下文（ContextVar 是线程局部的）
+            if chat_id and user_open_id:
+                set_request_context(chat_id, user_open_id)
+
             async def _chat():
                 async with ConversationClient(
                     session_id=session_id,
@@ -359,6 +387,8 @@ def chat_sync(
                     return r.content, r.session_id
             return loop.run_until_complete(_chat())
         finally:
+            # 清理上下文
+            clear_request_context()
             loop.close()
 
     with concurrent.futures.ThreadPoolExecutor() as executor:

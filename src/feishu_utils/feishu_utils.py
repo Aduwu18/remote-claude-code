@@ -86,17 +86,18 @@ def get_chats_member_list(chat_id, access_token=None):
     return res
 
 
-def create_p2p_chat(user_open_id: str, access_token=None) -> str:
+def create_group_chat(user_open_id: str, name: str, access_token=None) -> str:
     """
-    创建与用户的私聊会话
+    创建群聊会话
 
     需要飞书应用开通 im:chat:write 权限
 
     Args:
         user_open_id: 用户 open_id
+        name: 群聊名称
 
     Returns:
-        chat_id: 新创建的私聊 chat_id
+        chat_id: 新创建的群聊 chat_id
 
     Raises:
         Exception: 创建失败时抛出异常
@@ -106,10 +107,11 @@ def create_p2p_chat(user_open_id: str, access_token=None) -> str:
 
     url = 'https://open.feishu.cn/open-apis/im/v1/chats'
     body = {
-        "chat_mode": "p2p",
+        "chat_mode": "group",
+        "name": name,
         "user_id_list": [user_open_id]
     }
     res = requests.post(url, headers=get_headers(access_token), json=body).json()
     if res['code'] != 0:
-        raise Exception(f'创建私聊失败: {json.dumps(res, ensure_ascii=False)}')
+        raise Exception(f'创建群聊失败: {json.dumps(res, ensure_ascii=False)}')
     return res['data']['chat_id']

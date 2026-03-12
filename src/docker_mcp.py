@@ -5,11 +5,10 @@ Docker MCP Server
 """
 import asyncio
 import logging
+import os
 from typing import Optional, Callable, Any
 
 from claude_agent_sdk import tool, create_sdk_mcp_server, McpSdkServerConfig
-
-from src.context import get_current_chat_id, current_user_open_id
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +34,10 @@ def set_docker_session_handler(handler: Callable[[str, str, str], dict]):
 @tool(
     name="create_docker_session",
     description=(
-        "创建 Docker 容器专属会话。"
-        "当用户想要进入、连接或操作 Docker 容器时调用此工具。"
-        "例如用户说：进入 xxx 容器、连接到 xxx 容器、我要操作 xxx 容器。"
+        "【必须调用】创建 Docker 容器专属会话。"
+        "**当用户提到 Docker 容器相关操作时，必须调用此工具，而不是使用 Bash 的 docker exec。**"
+        "触发场景：用户说'进入容器'、'连接容器'、'在容器里操作'、'容器名称'等。"
+        "此工具会创建新的私聊窗口，用户可以在其中安全地操作容器。"
     ),
     input_schema={"container_name": str}
 )
@@ -51,27 +51,66 @@ async def create_docker_session_tool(args: dict) -> dict:
     Returns:
         MCP 工具响应格式: {"content": [{"type": "text", "text": "..."}]}
     """
+    logger.info(f"=== MCP 工具被调用 === args: {args}")
+
     container_name = args.get("container_name", "")
     if not container_name:
+        logger.warning("MCP 工具错误：未指定容器名称")
         return {
             "content": [{"type": "text", "text": "错误：未指定容器名称"}]
         }
 
-    # 从上下文获取当前请求信息
-    chat_id = get_current_chat_id()
-    user_open_id = current_user_open_id.get()
+    # 从环境变量获取上下文（SDK 通过 env 参数传递）
+    chat_id = os.environ.get("MCP_CHAT_ID")
+    user_open_id = os.environ.get("MCP_USER_OPEN_ID")
 
-    if not chat_id:
-        return {
-            "content": [{"type": "text", "text": "错误：无法获取聊天信息"}]
-        }
+    logger.info(f"MCP 工具上下文: chat_id={chat_id}, user_open_id={user_open_id}")
 
-    if not user_open_id:
-        return {
-            "content": [{"type": "text", "text": "错误：无法获取用户信息"}]
-        }
+    # 本地 CLI 模式：没有飞书上下文时，直接提供容器操作指引
+    if not chat_id or not user_open_id:
+        logger.info("MCP 工具：本地 CLI 模式，无飞书上下文")
+        import subprocess
+        try:
+            # 检查容器是否存在且运行
+            result = subprocess.run(
+                ["docker", "inspect", "--format={{.State.Running}}", container_name],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode != 0:
+                return {
+                    "content": [{"type": "text", "text": f"错误：容器 '{container_name}' 不存在"}]
+                }
+            if result.stdout.strip() != "true":
+                return {
+                    "content": [{"type": "text", "text": f"错误：容器 '{container_name}' 未运行"}]
+                }
+
+            # 返回本地模式提示
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"✅ 容器 '{container_name}' 已就绪（本地 CLI 模式）\n\n"
+                        f"容器正在运行，你可以直接让我在容器中执行命令。\n"
+                        f"例如：\n"
+                        f"- \"查看容器内的 /app 目录\"\n"
+                        f"- \"在容器里运行 ls -la\"\n"
+                        f"- \"检查容器的环境变量\"\n\n"
+                        f"我会使用 docker exec 帮你执行命令。"
+                    )
+                }]
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "content": [{"type": "text", "text": "错误：检查容器状态超时"}]
+            }
+        except Exception as e:
+            return {
+                "content": [{"type": "text", "text": f"错误：检查容器失败: {e}"}]
+            }
 
     if not _docker_session_handler:
+        logger.error("MCP 工具错误：Docker 会话功能未配置 (_docker_session_handler is None)")
         return {
             "content": [{"type": "text", "text": "错误：Docker 会话功能未配置"}]
         }

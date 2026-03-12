@@ -24,7 +24,7 @@ from lark_oapi.api.im.v1 import *
 
 from src.config import is_authorized, get_permission_config, get_authorized_users
 from src.claude_code import chat_sync, set_permission_request_callback
-from src.feishu_utils.feishu_utils import send_message, reply_message, create_p2p_chat
+from src.feishu_utils.feishu_utils import send_message, reply_message, create_group_chat
 from src.data_base_utils import get_session, save_session
 from src.permission_manager import (
     permission_manager,
@@ -134,7 +134,7 @@ def handle_docker_session_request(
         chat_id,
         f"🐳 创建容器会话: {container_name}\n\n"
         f"是否创建专属容器会话？(y/n)\n"
-        f"创建后将在新私聊窗口进行容器内操作。"
+        f"创建后将在新群聊窗口进行容器内操作。"
     )
 
     # 等待用户确认（阻塞）
@@ -173,9 +173,10 @@ def handle_docker_session_request(
             "message": "用户拒绝创建容器会话"
         }
 
-    # 用户确认，创建私聊会话
+    # 用户确认，创建群聊会话
     try:
-        docker_chat_id = create_p2p_chat(user_open_id)
+        group_name = f"🐳 {container_name} (Claude助手)"
+        docker_chat_id = create_group_chat(user_open_id, group_name)
 
         # 保存 Docker 会话映射
         docker_session_manager.create_docker_session(
@@ -192,11 +193,11 @@ def handle_docker_session_request(
         send_message(docker_chat_id, welcome_msg)
 
         # 在原窗口通知
-        send_message(chat_id, f"✅ 已创建容器会话，请在新的私聊窗口继续操作。")
+        send_message(chat_id, f"✅ 已创建容器会话，请在新的群聊窗口继续操作。")
 
         return {
             "success": True,
-            "message": f"容器会话已创建，请在新的私聊窗口继续",
+            "message": f"容器会话已创建，请在新的群聊窗口继续",
             "docker_chat_id": docker_chat_id
         }
 

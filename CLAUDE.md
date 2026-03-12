@@ -119,21 +119,21 @@ Each `chat_id` (private or group) maps to an independent Claude Code session sto
 │       ↓                                                               │
 │  Claude calls create_docker_session MCP tool                         │
 │       ↓                                                               │
-│  Tool reads context (chat_id, user_open_id) via contextvars          │
+│  Tool reads context via environment variables                         │
 │       ↓                                                               │
 │  Send confirmation request to Feishu                                 │
 │       ↓                                                               │
 │  User confirms (y/n)                                                 │
 │       ↓                                                               │
-│  Create private chat (P2P) for container session                     │
+│  Create group chat "🐳 {container} (Claude助手)"                     │
 │       ↓                                                               │
 │  Save mapping: docker_chat_id → container_name                       │
 │       ↓                                                               │
-│  User operates container in new chat window                          │
+│  User operates container in new group chat window                    │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-Docker sessions use `DOCKER_SYSTEM_PROMPT` which instructs Claude to use `docker exec` commands.
+Docker sessions create a dedicated group chat (not P2P) with a descriptive name, allowing Claude to execute commands in the specified container.
 
 ### Permission Model
 
@@ -188,7 +188,7 @@ async def create_docker_session_tool(args: dict) -> dict:
 
 ### 3. Request Context (`context.py`)
 
-Context is passed to MCP tools using `contextvars`:
+Context is passed to MCP tools using environment variables (cross-process compatible):
 
 ```python
 # Set context before calling Claude
@@ -198,9 +198,13 @@ try:
 finally:
     clear_request_context()
 
-# MCP tool reads context
-chat_id = get_current_chat_id()
+# MCP tool reads context from environment variables
+import os
+chat_id = os.environ.get("MCP_CHAT_ID")
+user_open_id = os.environ.get("MCP_USER_OPEN_ID")
 ```
+
+**Why environment variables:** MCP Server runs in a separate process, so `contextvars` cannot cross process boundaries. Environment variables provide a simple cross-process communication mechanism.
 
 ### 4. Permission Confirmation Flow
 
@@ -329,7 +333,20 @@ python test/call_claude_code.py
 1. Create app at [Feishu Open Platform](https://open.feishu.cn/)
 2. Event subscription → Select "Use long connection"
 3. Add event: `im.message.receive_v1`
-4. Permissions: `im:message` related permissions
+4. Permissions: Configure the following `im:message` related permissions:
+
+### Required Permissions
+
+| Permission | Description |
+|------------|-------------|
+| `im:chat` | Create and manage chats |
+| `im:message` | Basic message permissions |
+| `im:message:readonly` | Read message content |
+| `im:message:send_as_bot` | Send messages as bot |
+| `im:message.group_at_msg:readonly` | Receive @bot messages in groups |
+| `im:message.group_msg` | Receive all group messages (sensitive) |
+
+**Important:** After adding permissions, you must publish the app version for changes to take effect.
 
 ## Known Limitations
 
