@@ -1,0 +1,219 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+A Feishu (飞书) bot that integrates Claude Code CLI, enabling users to interact with Claude Code through Feishu chat. The bot supports multiple users with independent conversation contexts and can execute local computer operations.
+
+**Core Features:**
+- Multi-user support with independent conversation contexts per chat (private/group)
+- Session persistence via SQLite for conversation continuity across restarts
+- Local computer operations: file I/O, shell commands, application control
+- WebSocket long connection (no public domain required)
+
+## Quick Start
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Configure environment
+cp .env.example .env
+# Edit .env with APP_ID and APP_SECRET
+
+# Run (foreground)
+python -m src.main_websocket
+
+# Run (background)
+./start.sh
+
+# Stop
+./stop.sh
+
+# View logs
+tail -f log.log
+```
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `APP_ID` | Yes | Feishu application ID |
+| `APP_SECRET` | Yes | Feishu application secret |
+
+## Architecture
+
+### Core Modules
+
+| Module | Purpose |
+|--------|---------|
+| `src/main_websocket.py` | Main entry point - WebSocket long connection handler |
+| `src/main.py` | Alternative HTTP webhook handler (requires public domain) |
+| `src/claude_code/conversation.py` | Claude Code SDK wrapper with session management |
+| `src/feishu_utils/feishu_utils.py` | Feishu API utilities (send/reply messages) |
+| `src/data_base_utils/session_store.py` | SQLite session persistence |
+
+### Data Flow
+
+```
+Feishu Message → WebSocket → handle_message() → enqueue_message()
+                                                        ↓
+                                               chat_with_claude()
+                                                        ↓
+                                         session_store.get_session()
+                                                        ↓
+                                         claude_code.chat_sync()
+                                                        ↓
+                                         session_store.save_session()
+                                                        ↓
+                                         feishu_utils.reply/send_message()
+```
+
+### Session Model
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Feishu Chat ID          Claude Code Session        │
+├─────────────────────────────────────────────────────┤
+│  User A (private)  ────►  session_abc (isolated)    │
+│  User B (private)  ────►  session_xyz (isolated)    │
+│  Project Group     ────►  session_123 (shared)      │
+│  Test Group        ────►  session_456 (shared)      │
+└─────────────────────────────────────────────────────┘
+```
+
+Each `chat_id` (private or group) maps to an independent Claude Code session stored in SQLite.
+
+### Concurrency Model
+
+- **Per-chat serialization**: Messages from the same chat are processed FIFO via thread-safe queues
+- **Cross-chat parallelism**: Different chats can be processed concurrently
+- Active queues managed in `_active_queues` dict with `_queue_lock`
+
+## Key Patterns
+
+### 1. Claude Code Integration (`conversation.py`)
+
+```python
+# Async context manager for session lifecycle
+async with ConversationClient(session_id="xxx") as client:
+    response = await client.chat("message")
+    session_id = client.session_id  # New or existing session
+
+# Synchronous wrapper for non-async contexts
+reply, session_id = chat_sync("message", session_id="xxx")
+```
+
+**Important**: `chat_sync()` uses `ThreadPoolExecutor` with a new event loop to avoid conflicts with existing async contexts.
+
+### 2. Session Persistence
+
+- `get_session(chat_id)` → returns `session_id` or `None`
+- `save_session(chat_id, session_id)` → upsert mapping
+
+Database location: `data/sessions.db`
+
+### 3. Feishu Message Handling
+
+- Group chat: Use `reply_message(message_id, text)` to reply to specific message
+- Private chat: Use `send_message(chat_id, text)` for direct message
+
+### 4. WebSocket vs Webhook
+
+| Mode | File | Requirements |
+|------|------|--------------|
+| WebSocket | `main_websocket.py` | No public domain (recommended) |
+| Webhook | `main.py` | Public domain + ENCRYPT_KEY |
+
+## Claude Code Configuration
+
+The `ConversationClient` configures Claude Code with:
+
+- **Permission Mode**: `acceptEdits` (auto-accept file edits)
+- **Allowed Tools**: `["Read", "Write", "Edit", "Bash", "Glob", "Grep"]`
+- **System Prompt**: Local computer assistant with full system access
+
+See `SYSTEM_PROMPT` in `conversation.py` for full prompt text.
+
+## Extension Points
+
+### Replacing the Agent Backend
+
+Implement a `chat_sync(message, session_id)` function:
+
+```python
+def chat_sync(message: str, session_id: str = None) -> tuple[str, str]:
+    """
+    Args:
+        message: User message
+        session_id: Session ID for context continuity
+
+    Returns:
+        (reply_content, new_session_id)
+    """
+    # Your implementation
+    return reply, session_id
+```
+
+Then update the import in `main_websocket.py`:
+
+```python
+# Replace
+from src.claude_code import chat_sync
+
+# With
+from src.your_agent import chat_sync
+```
+
+## Testing
+
+```bash
+# Test Claude Code integration
+python test/call_claude_code.py
+```
+
+## Project Structure
+
+```
+├── src/
+│   ├── main_websocket.py      # Main entry (WebSocket)
+│   ├── main.py                # Alternative (HTTP webhook)
+│   ├── claude_code/
+│   │   ├── __init__.py
+│   │   └── conversation.py    # Claude Code client
+│   ├── feishu_utils/
+│   │   ├── __init__.py
+│   │   └── feishu_utils.py    # Feishu API helpers
+│   └── data_base_utils/
+│       ├── __init__.py
+│       └── session_store.py   # SQLite session storage
+├── data/
+│   └── sessions.db            # Session mappings (auto-created)
+├── test/
+│   └── call_claude_code.py    # Integration test
+├── .env                       # Environment variables
+├── start.sh / stop.sh         # Process management
+└── requirements.txt
+```
+
+## Dependencies
+
+- `claude-agent-sdk` - Claude Code Python SDK
+- `lark-oapi` - Feishu/Lark official SDK
+- `pycryptodome` - AES encryption (webhook mode)
+- `python-dotenv` - Environment management
+
+## Feishu App Configuration
+
+1. Create app at [Feishu Open Platform](https://open.feishu.cn/)
+2. Event subscription → Select "Use long connection"
+3. Add event: `im.message.receive_v1`
+4. Permissions: `im:message` related permissions
+
+## Known Limitations
+
+- No message rate limiting
+- No user authorization checks (anyone who can message the bot can use it)
+- Session cleanup not implemented (sessions accumulate in SQLite)
+- No health check endpoint for WebSocket mode

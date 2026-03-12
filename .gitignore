@@ -13,6 +13,7 @@ venv/
 # 环境变量
 .env
 .env.local
+.config.yaml
 
 # IDE
 .idea/

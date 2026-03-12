@@ -5,6 +5,7 @@
 # 查看方式：在飞书中打开机器人对话，发送任意消息后查看日志中的 sender_id
 authorized_users:
   # - "ou_xxxxxx"  # 替换为您的实际 open_id
+  - "ou_251e9e28dc6791cfcbcf8dcc5978bf38"
 
 # 权限确认设置
 permission:
