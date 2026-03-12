@@ -137,6 +137,7 @@ permission:
 | `im:message:readonly` | 读取消息内容 |
 | `im:message:send_as_bot` | 以机器人身份发送消息 |
 | `im:message.group_at_msg:readonly` | 接收群聊 @ 消息 |
+| `im:message.group_msg` | 接收群聊所有消息（无需 @） |
 
 **注意：** 添加权限后需要发布应用版本才能生效。
 
@@ -158,13 +159,15 @@ tail -f log.log
 
 ## 使用示例
 
-在飞书中 @机器人：
+**私聊：** 直接发送消息
+
+**群聊：** 直接发送消息即可（已配置接收所有群消息权限，无需 @机器人）
 
 ```
-@机器人 帮我创建一个 hello.py 文件
-@机器人 运行刚才的脚本
-@机器人 打开网易云音乐
-@机器人 当前目录有哪些文件
+帮我创建一个 hello.py 文件
+运行刚才的脚本
+打开网易云音乐
+当前目录有哪些文件
 ```
 
 **权限确认：**
@@ -189,7 +192,7 @@ tail -f log.log
 **Docker 容器操作：**
 
 ```
-@机器人 进入 nginx 容器
+进入 nginx 容器
 
 # Claude 会调用 create_docker_session 工具
 # 确认后创建专属群聊 "🐳 nginx (Claude助手)"
