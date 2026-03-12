@@ -9,7 +9,8 @@ A Feishu (飞书) bot that integrates Claude Code CLI, enabling users to interac
 **Core Features:**
 - Multi-user support with independent conversation contexts per chat (private/group)
 - Session persistence via SQLite for conversation continuity across restarts
-- Local computer operations: file I/O, shell commands, application control
+- User authorization via `config.yaml` whitelist
+- Permission confirmation flow for sensitive operations (Write, Edit, Bash)
 - WebSocket long connection (no public domain required)
 
 ## Quick Start
@@ -42,6 +43,22 @@ tail -f log.log
 | `APP_ID` | Yes | Feishu application ID |
 | `APP_SECRET` | Yes | Feishu application secret |
 
+## Configuration (`config.yaml`)
+
+```yaml
+# User whitelist (Feishu open_id)
+authorized_users:
+  - "ou_xxxxxx"  # Find open_id in logs after sending a message
+
+# Permission confirmation settings
+permission:
+  enabled: true    # Require confirmation for sensitive operations
+  timeout: 0       # 0 = wait indefinitely
+```
+
+- Copy `config.example.yaml` to `config.yaml` and configure
+- `authorized_users` is **required** - unauthorized users will be rejected
+
 ## Architecture
 
 ### Core Modules
@@ -51,6 +68,8 @@ tail -f log.log
 | `src/main_websocket.py` | Main entry point - WebSocket long connection handler |
 | `src/main.py` | Alternative HTTP webhook handler (requires public domain) |
 | `src/claude_code/conversation.py` | Claude Code SDK wrapper with session management |
+| `src/permission_manager.py` | Permission confirmation state management |
+| `src/config.py` | Configuration loading (YAML + env vars) and user authorization |
 | `src/feishu_utils/feishu_utils.py` | Feishu API utilities (send/reply messages) |
 | `src/data_base_utils/session_store.py` | SQLite session persistence |
 
@@ -85,6 +104,12 @@ Feishu Message → WebSocket → handle_message() → enqueue_message()
 
 Each `chat_id` (private or group) maps to an independent Claude Code session stored in SQLite.
 
+### Permission Model
+
+1. **User Authorization**: `authorized_users` in `config.yaml` controls who can use the bot
+2. **Permission Confirmation**: Sensitive tools (Write, Edit, Bash) require user confirmation via Feishu message
+3. **Safe Tools**: Read, Glob, Grep bypass permission confirmation
+
 ### Concurrency Model
 
 - **Per-chat serialization**: Messages from the same chat are processed FIFO via thread-safe queues
@@ -107,19 +132,35 @@ reply, session_id = chat_sync("message", session_id="xxx")
 
 **Important**: `chat_sync()` uses `ThreadPoolExecutor` with a new event loop to avoid conflicts with existing async contexts.
 
-### 2. Session Persistence
+### 2. Permission Confirmation Flow
+
+```
+Claude calls tool → _check_permission() → handle_permission_request()
+                                                    ↓
+                                    send_message() to Feishu
+                                                    ↓
+                                    permission_manager.request_permission() (blocks)
+                                                    ↓
+                            User replies "y"/"n" → submit_response() → unblocks
+```
+
+- `PermissionManager` manages pending requests and responses
+- Permission callback is set via `set_permission_request_callback()` at startup
+- User confirmation keywords: "y", "yes", "确认", "允许" (approve) / "n", "no", "拒绝", "取消" (deny)
+
+### 3. Session Persistence
 
 - `get_session(chat_id)` → returns `session_id` or `None`
 - `save_session(chat_id, session_id)` → upsert mapping
 
 Database location: `data/sessions.db`
 
-### 3. Feishu Message Handling
+### 4. Feishu Message Handling
 
 - Group chat: Use `reply_message(message_id, text)` to reply to specific message
 - Private chat: Use `send_message(chat_id, text)` for direct message
 
-### 4. WebSocket vs Webhook
+### 5. WebSocket vs Webhook
 
 | Mode | File | Requirements |
 |------|------|--------------|
@@ -179,6 +220,8 @@ python test/call_claude_code.py
 ├── src/
 │   ├── main_websocket.py      # Main entry (WebSocket)
 │   ├── main.py                # Alternative (HTTP webhook)
+│   ├── config.py              # Configuration & user authorization
+│   ├── permission_manager.py  # Permission confirmation state
 │   ├── claude_code/
 │   │   ├── __init__.py
 │   │   └── conversation.py    # Claude Code client
@@ -192,6 +235,8 @@ python test/call_claude_code.py
 │   └── sessions.db            # Session mappings (auto-created)
 ├── test/
 │   └── call_claude_code.py    # Integration test
+├── config.yaml                # User configuration (gitignored)
+├── config.example.yaml        # Configuration template
 ├── .env                       # Environment variables
 ├── start.sh / stop.sh         # Process management
 └── requirements.txt
@@ -203,6 +248,7 @@ python test/call_claude_code.py
 - `lark-oapi` - Feishu/Lark official SDK
 - `pycryptodome` - AES encryption (webhook mode)
 - `python-dotenv` - Environment management
+- `PyYAML` - Configuration file parsing
 
 ## Feishu App Configuration
 
@@ -214,6 +260,5 @@ python test/call_claude_code.py
 ## Known Limitations
 
 - No message rate limiting
-- No user authorization checks (anyone who can message the bot can use it)
 - Session cleanup not implemented (sessions accumulate in SQLite)
 - No health check endpoint for WebSocket mode
