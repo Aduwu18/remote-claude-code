@@ -3,3 +3,4 @@ lark-oapi>=1.0.0
 pycryptodome>=3.0.0
 python-dotenv>=1.0.0
 nest-asyncio>=1.5.0
+PyYAML>=6.0

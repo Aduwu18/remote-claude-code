@@ -1,0 +1,18 @@
+# 飞书机器人配置示例
+# 复制此文件为 config.yaml 并填入实际值
+
+# 用户白名单（飞书 open_id）
+# 查看方式：在飞书中打开机器人对话，发送任意消息后查看日志中的 sender_id
+authorized_users:
+  - "ou_xxxxxx"  # 用户A - 替换为实际的 open_id
+  - "ou_yyyyyy"  # 用户B - 替换为实际的 open_id
+
+# 单用户/开发模式
+# 如果只有一个用户，直接将 open_id 添加到 authorized_users 列表即可
+
+# 可选：权限确认设置
+permission:
+  # 是否启用权限确认（需要用户确认每个操作）
+  enabled: true
+  # 权限确认超时时间（秒），0 表示无限等待
+  timeout: 0
