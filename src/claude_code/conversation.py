@@ -3,9 +3,11 @@ Claude Code 连续对话客户端
 
 支持权限确认 hook，将 Claude 的操作请求发送到飞书端让用户确认
 支持 Docker 容器会话（通过 MCP 工具）
+支持执行状态反馈，实时更新任务进度
 """
 import asyncio
-from typing import Optional, Callable
+import logging
+from typing import Optional, Callable, TYPE_CHECKING
 from dataclasses import dataclass
 
 from claude_agent_sdk import (
@@ -16,6 +18,11 @@ from claude_agent_sdk import (
     ToolUseBlock,
     ResultMessage,
 )
+
+if TYPE_CHECKING:
+    from src.status_manager import StatusManager
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -180,6 +187,7 @@ class ConversationClient:
         require_confirmation: bool = True,
         container: str = None,
         user_open_id: str = None,
+        status_manager: "StatusManager" = None,
     ):
         self._initial_session_id = session_id
         self.session_id: Optional[str] = session_id
@@ -193,6 +201,7 @@ class ConversationClient:
         self.container = container
         self.require_confirmation = require_confirmation
         self._client: Optional[ClaudeSDKClient] = None
+        self.status_manager = status_manager
 
         # 根据 container 设置系统提示
         if system_prompt:
@@ -242,6 +251,10 @@ class ConversationClient:
         tool_calls = []
 
         async for msg in self._client.receive_response():
+            # 更新状态（如果有状态管理器）
+            if self.status_manager:
+                self._update_status(msg)
+
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
                     if isinstance(block, TextBlock):
@@ -276,6 +289,21 @@ class ConversationClient:
             tool_calls=tool_calls,
             session_id=self.session_id or "",
         )
+
+    def _update_status(self, msg) -> None:
+        """
+        根据消息类型更新状态
+
+        Args:
+            msg: SDK 消息对象
+        """
+        from src.status_aware_chat import StatusAwareChat
+
+        try:
+            status_chat = StatusAwareChat(self.status_manager)
+            status_chat.on_message(msg)
+        except Exception as e:
+            logger.debug(f"状态更新失败（非关键）: {e}")
 
     async def _check_permission(self, tool_name: str, tool_input: dict) -> bool:
         """
@@ -342,6 +370,7 @@ def chat_sync(
     require_confirmation: bool = True,
     container: str = None,
     user_open_id: str = None,
+    status_manager: "StatusManager" = None,
 ) -> tuple[str, str]:
     """
     同步调用 Claude Code（在独立线程中运行，避免事件循环冲突）
@@ -353,6 +382,7 @@ def chat_sync(
         require_confirmation: 是否需要权限确认
         container: Docker 容器名（可选，用于容器内执行）
         user_open_id: 用户 open_id（可选，用于创建容器会话）
+        status_manager: 状态管理器（可选，用于实时状态反馈）
 
     Returns:
         (回复内容, session_id)
@@ -382,6 +412,7 @@ def chat_sync(
                     require_confirmation=require_confirmation,
                     container=container,
                     user_open_id=user_open_id,
+                    status_manager=status_manager,
                 ) as client:
                     r = await client.chat(message)
                     return r.content, r.session_id

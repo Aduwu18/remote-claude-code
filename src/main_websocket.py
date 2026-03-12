@@ -13,6 +13,10 @@ import os
 from dotenv import load_dotenv
 load_dotenv()  # 必须在导入其他模块之前加载
 
+# 取消 CLAUDECODE 环境变量，避免嵌套会话错误
+# (Bot 可能运行在 Claude Code 会话中)
+os.environ.pop('CLAUDECODE', None)
+
 import json
 import logging
 import threading
@@ -33,6 +37,7 @@ from src.permission_manager import (
 from src.docker_session_manager import docker_session_manager
 from src.docker_mcp import set_docker_session_handler
 from src.context import set_request_context, clear_request_context
+from src.status_manager import StatusManager
 
 APP_ID = os.getenv("APP_ID")
 APP_SECRET = os.getenv("APP_SECRET")
@@ -213,10 +218,14 @@ def chat_with_claude(chat_id: str, message: str, user_open_id: str = None) -> st
     """
     调用 Claude Code，基于 chat_id 保持对话连续性
     支持 Docker 容器会话
+    支持实时状态反馈
     """
     # 设置请求上下文（供 MCP 工具使用）
     if user_open_id:
         set_request_context(chat_id, user_open_id)
+
+    # 创建状态管理器
+    status_mgr = StatusManager(chat_id)
 
     try:
         # 从 SQLite 获取之前的 session_id
@@ -229,7 +238,10 @@ def chat_with_claude(chat_id: str, message: str, user_open_id: str = None) -> st
         # 检查是否是 Docker 会话
         container = docker_session_manager.get_container_for_chat(chat_id)
 
-        # 调用 Claude
+        # 发送初始状态消息
+        status_mgr.send_status("⏳ 正在处理您的请求...")
+
+        # 调用 Claude（带状态管理器）
         reply, new_session_id = chat_sync(
             message,
             session_id=session_id,
@@ -237,7 +249,11 @@ def chat_with_claude(chat_id: str, message: str, user_open_id: str = None) -> st
             require_confirmation=require_confirmation,
             container=container,
             user_open_id=user_open_id,
+            status_manager=status_mgr,
         )
+
+        # 替换状态消息为最终结果
+        status_mgr.finalize(reply)
 
         # 保存到 SQLite
         if new_session_id != session_id:
@@ -245,6 +261,10 @@ def chat_with_claude(chat_id: str, message: str, user_open_id: str = None) -> st
             logger.info(f"会话映射: {chat_id[:8]}... -> {new_session_id[:8]}...")
 
         return reply
+    except Exception as e:
+        logger.error(f"处理请求失败: {e}")
+        status_mgr.finalize(f"❌ 执行出错: {e}")
+        raise
     finally:
         # 清理请求上下文
         clear_request_context()

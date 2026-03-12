@@ -115,3 +115,59 @@ def create_group_chat(user_open_id: str, name: str, access_token=None) -> str:
     if res['code'] != 0:
         raise Exception(f'创建群聊失败: {json.dumps(res, ensure_ascii=False)}')
     return res['data']['chat_id']
+
+
+def update_message(message_id: str, text: str, access_token=None) -> dict:
+    """
+    更新已发送消息的内容
+
+    API: PATCH /im/v1/messages/:message_id
+    文档: https://open.feishu.cn/document/server-docs/im-v1/message/update
+
+    Args:
+        message_id: 消息 ID
+        text: 新的消息内容
+        access_token: 访问令牌（可选）
+
+    Returns:
+        dict: API 响应
+    """
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    url = f'https://open.feishu.cn/open-apis/im/v1/messages/{message_id}'
+    body = {
+        "msg_type": "text",
+        "content": json.dumps({"text": text}, ensure_ascii=False)
+    }
+    res = requests.patch(url, headers=get_headers(access_token), json=body)
+    return res.json()
+
+
+def send_message_with_id(receive_id: str, text: str, access_token=None) -> dict:
+    """
+    发送消息并返回完整响应（包含 message_id）
+
+    Args:
+        receive_id: 接收者 ID (chat_id)
+        text: 消息内容
+        access_token: 访问令牌（可选）
+
+    Returns:
+        dict: API 响应，包含 {"code": 0, "data": {"message_id": "xxx"}}
+    """
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    url = 'https://open.feishu.cn/open-apis/im/v1/messages'
+    param = {'receive_id_type': 'chat_id'}
+
+    body = {
+        'receive_id': receive_id,
+        "msg_type": "text",
+        "content": json.dumps({"text": text}, ensure_ascii=False),
+        'uuid': str(datetime.datetime.now().timestamp())
+    }
+
+    res = requests.post(url, headers=get_headers(access_token), json=body, params=param)
+    return res.json()
