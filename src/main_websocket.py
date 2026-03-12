@@ -284,10 +284,8 @@ def _process_chat_queue(chat_id: str, message_id: str, chat_type: str, queue: Qu
 
         try:
             reply = chat_with_claude(chat_id, text, user_open_id)
-            if chat_type == "group":
-                reply_message(message_id, reply)
-            else:
-                send_message(chat_id, reply)
+            # 注意：chat_with_claude 内部通过 StatusManager.finalize() 已经发送了最终结果
+            # 这里不再重复发送
             logger.info(f"回复: {reply[:100]}...")
         except Exception as e:
             logger.error(f"处理失败 [{chat_id[:8]}...]: {e}")
