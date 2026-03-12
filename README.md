@@ -18,6 +18,7 @@
 │  李四 私聊  ────────►  session_xyz (独立上下文)      │
 │  项目群聊   ────────►  session_123 (共享上下文)      │
 │  测试群聊   ────────►  session_456 (共享上下文)      │
+│  容器群聊   ────────►  session_789 (容器上下文)      │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -28,10 +29,16 @@
 - 打开/关闭应用程序
 - Git 操作、包管理等开发任务
 
+**权限确认机制**
+
+- 敏感操作（写文件、执行命令）需要用户确认
+- 飞书端实时弹窗，回复 "y/n" 控制
+- 可配置开关和超时时间
+
 **Docker 容器会话**
 
 - 通过自然语言进入指定容器：`进入 xxx 容器`
-- 为每个容器创建独立的私聊窗口
+- 为每个容器创建独立的群聊窗口
 - 在容器内执行命令、操作文件
 - 自动读取容器内的授权用户配置
 
@@ -90,15 +97,50 @@ npm install -g @anthropic-ai/claude-code
 claude login
 ```
 
-### 4. 飞书应用配置
+### 4. 配置用户白名单
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+编辑 `config.yaml`，添加授权用户的飞书 `open_id`：
+
+```yaml
+# 用户白名单（飞书 open_id）
+authorized_users:
+  - "ou_xxxxxx"  # 用户A
+  - "ou_yyyyyy"  # 用户B
+
+# 权限确认设置
+permission:
+  enabled: true   # 启用敏感操作确认
+  timeout: 0      # 超时时间（秒），0 表示无限等待
+```
+
+**如何获取 open_id：**
+1. 启动机器人
+2. 在飞书中给机器人发送任意消息
+3. 查看日志中的 `sender_id` 字段，即为 `open_id`
+
+### 5. 飞书应用配置
 
 1. 进入 [飞书开放平台](https://open.feishu.cn/)
 2. 创建应用，获取 APP_ID 和 APP_SECRET
 3. 事件订阅 → 选择"使用长连接接收事件"
 4. 添加事件：`im.message.receive_v1`
-5. 权限管理 → 添加 `im:message` 相关权限
+5. 权限管理 → 添加以下权限
 
-### 5. 启动
+| 权限 | 说明 |
+|------|------|
+| `im:chat` | 创建群聊（Docker 会话需要） |
+| `im:message` | 基础消息权限 |
+| `im:message:readonly` | 读取消息内容 |
+| `im:message:send_as_bot` | 以机器人身份发送消息 |
+| `im:message.group_at_msg:readonly` | 接收群聊 @ 消息 |
+
+**注意：** 添加权限后需要发布应用版本才能生效。
+
+### 6. 启动
 
 ```bash
 # 前台运行
@@ -125,14 +167,50 @@ tail -f log.log
 @机器人 当前目录有哪些文件
 ```
 
+**权限确认：**
+
+当 Claude 执行敏感操作时，会发送确认请求：
+
+```
+🔒 权限确认请求
+
+操作: Write
+详情:
+{
+  "file_path": "/home/user/hello.py",
+  "content": "print('hello')"
+}
+
+请回复:
+• "y" 或 "确认" - 允许执行
+• "n" 或 "拒绝" - 拒绝执行
+```
+
+**Docker 容器操作：**
+
+```
+@机器人 进入 nginx 容器
+
+# Claude 会调用 create_docker_session 工具
+# 确认后创建专属群聊 "🐳 nginx (Claude助手)"
+# 在新窗口中操作容器
+```
+
+容器会话中支持的命令：
+- 容器内文件操作
+- 容器内命令执行
+- `/exit` 退出容器会话
+
 ## 项目结构
 
 ```
 ├── src/
 │   ├── main_websocket.py      # 主程序（飞书长连接）
+│   ├── config.py              # 配置加载与用户授权
 │   ├── context.py             # 请求上下文管理
+│   ├── permission_manager.py  # 权限确认状态管理
 │   ├── docker_mcp.py          # Docker MCP Server
-│   ├── docker_session_manager.py  # Docker 会话管理
+│   ├── docker_session_manager.py  # Docker 会话持久化
 │   ├── claude_code/           # Claude Code 封装
 │   │   ├── conversation.py    # 对话客户端
 │   │   └── __init__.py
@@ -143,6 +221,8 @@ tail -f log.log
 ├── data/
 │   ├── sessions.db            # SQLite 数据库
 │   └── docker_sessions.db     # Docker 会话数据库
+├── config.yaml                # 用户配置（白名单等）
+├── config.example.yaml        # 配置模板
 ├── .env                       # 环境变量
 ├── start.sh / stop.sh         # 启停脚本
 └── requirements.txt
