@@ -28,6 +28,13 @@
 - 打开/关闭应用程序
 - Git 操作、包管理等开发任务
 
+**Docker 容器会话**
+
+- 通过自然语言进入指定容器：`进入 xxx 容器`
+- 为每个容器创建独立的私聊窗口
+- 在容器内执行命令、操作文件
+- 自动读取容器内的授权用户配置
+
 ## 与 ClawdBot 的比较
 
 | 特性 | 本项目 | ClawdBot |
@@ -123,6 +130,9 @@ tail -f log.log
 ```
 ├── src/
 │   ├── main_websocket.py      # 主程序（飞书长连接）
+│   ├── context.py             # 请求上下文管理
+│   ├── docker_mcp.py          # Docker MCP Server
+│   ├── docker_session_manager.py  # Docker 会话管理
 │   ├── claude_code/           # Claude Code 封装
 │   │   ├── conversation.py    # 对话客户端
 │   │   └── __init__.py
@@ -131,7 +141,8 @@ tail -f log.log
 │   └── data_base_utils/       # 数据库
 │       └── session_store.py   # 会话存储
 ├── data/
-│   └── sessions.db            # SQLite 数据库
+│   ├── sessions.db            # SQLite 数据库
+│   └── docker_sessions.db     # Docker 会话数据库
 ├── .env                       # 环境变量
 ├── start.sh / stop.sh         # 启停脚本
 └── requirements.txt

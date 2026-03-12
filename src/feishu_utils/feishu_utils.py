@@ -69,18 +69,47 @@ def get_department_member_list(department_id, access_token=None):
 def get_chats_member_list(chat_id, access_token=None):
     if access_token is None:
         access_token = get_tenant_access_token()
-        
+
     # 先查看机器人是否在群里
     url = f'https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}/members/is_in_chat'
     res = requests.get(url, headers=get_headers(access_token)).json()
     if res['code'] !=0 or not res['data']['is_in_chat']:
         return {"data" : {"items": []}}
         # raise Exception(f'get_chats_member_list() get err res:{json.dumps(res)}')
-    
+
     # 获取群成员列表
     url = f'https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}/members'
     res = requests.get(url, headers=get_headers(access_token)).json()
-    
+
     if res['code'] !=0:
         raise Exception(f'get_chats_member_list() get err res:{json.dumps(res)}')
     return res
+
+
+def create_p2p_chat(user_open_id: str, access_token=None) -> str:
+    """
+    创建与用户的私聊会话
+
+    需要飞书应用开通 im:chat:write 权限
+
+    Args:
+        user_open_id: 用户 open_id
+
+    Returns:
+        chat_id: 新创建的私聊 chat_id
+
+    Raises:
+        Exception: 创建失败时抛出异常
+    """
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    url = 'https://open.feishu.cn/open-apis/im/v1/chats'
+    body = {
+        "chat_mode": "p2p",
+        "user_id_list": [user_open_id]
+    }
+    res = requests.post(url, headers=get_headers(access_token), json=body).json()
+    if res['code'] != 0:
+        raise Exception(f'创建私聊失败: {json.dumps(res, ensure_ascii=False)}')
+    return res['data']['chat_id']

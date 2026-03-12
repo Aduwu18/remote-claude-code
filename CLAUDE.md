@@ -12,6 +12,7 @@ A Feishu (飞书) bot that integrates Claude Code CLI, enabling users to interac
 - User authorization via `config.yaml` whitelist
 - Permission confirmation flow for sensitive operations (Write, Edit, Bash)
 - WebSocket long connection (no public domain required)
+- Docker container sessions with isolated contexts per container
 
 ## Quick Start
 
@@ -68,6 +69,9 @@ permission:
 | `src/main_websocket.py` | Main entry point - WebSocket long connection handler |
 | `src/main.py` | Alternative HTTP webhook handler (requires public domain) |
 | `src/claude_code/conversation.py` | Claude Code SDK wrapper with session management |
+| `src/docker_mcp.py` | Docker MCP Server with `create_docker_session` tool |
+| `src/context.py` | Request context management using `contextvars` |
+| `src/docker_session_manager.py` | Docker container session persistence |
 | `src/permission_manager.py` | Permission confirmation state management |
 | `src/config.py` | Configuration loading (YAML + env vars) and user authorization |
 | `src/feishu_utils/feishu_utils.py` | Feishu API utilities (send/reply messages) |
@@ -99,10 +103,37 @@ Feishu Message → WebSocket → handle_message() → enqueue_message()
 │  User B (private)  ────►  session_xyz (isolated)    │
 │  Project Group     ────►  session_123 (shared)      │
 │  Test Group        ────►  session_456 (shared)      │
+│  Docker Container  ────►  session_789 (container)   │
 └─────────────────────────────────────────────────────┘
 ```
 
 Each `chat_id` (private or group) maps to an independent Claude Code session stored in SQLite.
+
+### Docker Container Session Model
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    Docker Container Session Flow                      │
+├──────────────────────────────────────────────────────────────────────┤
+│  User: "进入 xxx 容器"                                                │
+│       ↓                                                               │
+│  Claude calls create_docker_session MCP tool                         │
+│       ↓                                                               │
+│  Tool reads context (chat_id, user_open_id) via contextvars          │
+│       ↓                                                               │
+│  Send confirmation request to Feishu                                 │
+│       ↓                                                               │
+│  User confirms (y/n)                                                 │
+│       ↓                                                               │
+│  Create private chat (P2P) for container session                     │
+│       ↓                                                               │
+│  Save mapping: docker_chat_id → container_name                       │
+│       ↓                                                               │
+│  User operates container in new chat window                          │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Docker sessions use `DOCKER_SYSTEM_PROMPT` which instructs Claude to use `docker exec` commands.
 
 ### Permission Model
 
@@ -132,7 +163,46 @@ reply, session_id = chat_sync("message", session_id="xxx")
 
 **Important**: `chat_sync()` uses `ThreadPoolExecutor` with a new event loop to avoid conflicts with existing async contexts.
 
-### 2. Permission Confirmation Flow
+### 2. MCP Server for Docker Sessions (`docker_mcp.py`)
+
+Docker container sessions use SDK's standard MCP tool mechanism:
+
+```python
+@tool(
+    name="create_docker_session",
+    description="创建 Docker 容器专属会话...",
+    input_schema={"container_name": str}
+)
+async def create_docker_session_tool(args: dict) -> dict:
+    # Read context via contextvars
+    chat_id = get_current_chat_id()
+    user_open_id = get_current_user_open_id()
+    # ... handle session creation
+```
+
+**Why MCP Tools instead of Prompt Engineering:**
+- **Reliable**: SDK-native tool calling, not regex parsing
+- **Type-safe**: Schema validation on inputs
+- **Result feedback**: Claude sees tool execution results
+- **Standard**: Follows MCP protocol specification
+
+### 3. Request Context (`context.py`)
+
+Context is passed to MCP tools using `contextvars`:
+
+```python
+# Set context before calling Claude
+set_request_context(chat_id, user_open_id)
+try:
+    reply = chat_sync(message, ...)
+finally:
+    clear_request_context()
+
+# MCP tool reads context
+chat_id = get_current_chat_id()
+```
+
+### 4. Permission Confirmation Flow
 
 ```
 Claude calls tool → _check_permission() → handle_permission_request()
@@ -148,19 +218,19 @@ Claude calls tool → _check_permission() → handle_permission_request()
 - Permission callback is set via `set_permission_request_callback()` at startup
 - User confirmation keywords: "y", "yes", "确认", "允许" (approve) / "n", "no", "拒绝", "取消" (deny)
 
-### 3. Session Persistence
+### 5. Session Persistence
 
 - `get_session(chat_id)` → returns `session_id` or `None`
 - `save_session(chat_id, session_id)` → upsert mapping
 
 Database location: `data/sessions.db`
 
-### 4. Feishu Message Handling
+### 6. Feishu Message Handling
 
 - Group chat: Use `reply_message(message_id, text)` to reply to specific message
 - Private chat: Use `send_message(chat_id, text)` for direct message
 
-### 5. WebSocket vs Webhook
+### 7. WebSocket vs Webhook
 
 | Mode | File | Requirements |
 |------|------|--------------|
@@ -221,6 +291,9 @@ python test/call_claude_code.py
 │   ├── main_websocket.py      # Main entry (WebSocket)
 │   ├── main.py                # Alternative (HTTP webhook)
 │   ├── config.py              # Configuration & user authorization
+│   ├── context.py             # Request context management (contextvars)
+│   ├── docker_mcp.py          # Docker MCP Server & tools
+│   ├── docker_session_manager.py  # Docker session persistence
 │   ├── permission_manager.py  # Permission confirmation state
 │   ├── claude_code/
 │   │   ├── __init__.py
@@ -232,7 +305,8 @@ python test/call_claude_code.py
 │       ├── __init__.py
 │       └── session_store.py   # SQLite session storage
 ├── data/
-│   └── sessions.db            # Session mappings (auto-created)
+│   ├── sessions.db            # Session mappings (auto-created)
+│   └── docker_sessions.db     # Docker session mappings (auto-created)
 ├── test/
 │   └── call_claude_code.py    # Integration test
 ├── config.yaml                # User configuration (gitignored)
