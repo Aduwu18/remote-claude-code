@@ -222,10 +222,15 @@ src/
 data/
 └── docker_sessions.db       # Docker 会话数据库
 
-.devcontainer/               # 开发容器配置
-├── devcontainer.json
-├── Dockerfile
-└── startup.sh
+deploy/                      # 可插拔部署配置
+├── docker-compose.guest-proxy.yml
+├── Dockerfile.overlay
+├── README.md
+├── requirements-guest-proxy.txt
+└── start-guest-proxy.sh
+
+docs/                        # 文档
+└── GUEST_PROXY_INTEGRATION.md
 ```
 
 ## 技术栈
@@ -236,17 +241,29 @@ data/
 - Redis（路由索引）
 - aiohttp（HTTP 服务）
 
-## .devcontainer 注入
+## 可插拔集成
 
-将 `.devcontainer/` 目录复制到目标容器内，可快速部署 Guest Proxy：
+将 Guest Proxy 集成到现有开发环境，详见 [集成文档](docs/GUEST_PROXY_INTEGRATION.md)。
+
+**快速集成：**
 
 ```bash
-# 在容器内
-cd /path/to/.devcontainer
-./startup.sh
+# 1. 复制模块到目标项目
+cp -r src/guest_proxy src/protocol /your-project/src/
+
+# 2. 安装依赖
+pip install -r deploy/requirements-guest-proxy.txt
+
+# 3. 设置环境变量
+export HOST_BRIDGE_URL=http://host.docker.internal:8080
+export ANTHROPIC_API_KEY=your-key
+
+# 4. 启动
+./deploy/start-guest-proxy.sh
 ```
 
-环境变量：
-- `HOST_BRIDGE_URL`: Host Bridge 地址
-- `CONTAINER_NAME`: 容器名称
-- `GUEST_PROXY_PORT`: 监听端口（默认 8081）
+**Docker Compose 集成：**
+
+```bash
+docker-compose -f docker-compose.yml -f deploy/docker-compose.guest-proxy.yml up -d
+```

@@ -1,0 +1,5 @@
+# Guest Proxy 最小依赖
+# 复制此文件到目标项目的 requirements.txt 中
+
+aiohttp>=3.8.0
+claude-agent-sdk>=0.1.0

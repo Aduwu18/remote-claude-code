@@ -1,0 +1,34 @@
+# Docker Compose Overlay - Guest Proxy 集成
+# 使用方法: 将此内容合并到现有 docker-compose.yml
+#
+# docker-compose -f docker-compose.yml -f docker-compose.guest-proxy.yml up -d
+
+version: '3.8'
+
+services:
+  # 将以下配置合并到您的服务中
+  your-service-name:
+    environment:
+      # Guest Proxy 配置
+      - HOST_BRIDGE_URL=${HOST_BRIDGE_URL:-http://host.docker.internal:8080}
+      - GUEST_PROXY_PORT=${GUEST_PROXY_PORT:-8081}
+      - CONTAINER_NAME=${CONTAINER_NAME:-}
+      # Claude API Key
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+
+    # Linux 宿主机需要此配置
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    # 标签（可选，用于服务发现）
+    labels:
+      - "claude.guest-proxy.enabled=true"
+      - "claude.guest-proxy.port=8081"
