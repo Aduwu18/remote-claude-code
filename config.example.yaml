@@ -16,3 +16,20 @@ permission:
   enabled: true
   # 权限确认超时时间（秒），0 表示无限等待
   timeout: 0
+
+# Redis 配置（Host-Guest 通信路由）
+# 可通过环境变量 REDIS_URL 和 REDIS_PASSWORD 覆盖
+redis:
+  url: "redis://localhost:6379/0"
+  # password: "your_redis_password"  # 可选
+
+# Host Bridge 配置（宿主机网关）
+host_bridge:
+  port: 8080
+  host: "0.0.0.0"
+
+# Guest Proxy 配置（容器内代理）
+# 可通过环境变量 HOST_BRIDGE_URL 覆盖
+guest_proxy:
+  port: 8081
+  host_bridge_url: "http://host.docker.internal:8080"

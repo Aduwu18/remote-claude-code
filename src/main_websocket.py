@@ -1,43 +1,60 @@
 """
-飞书长连接方式接收消息
+飞书消息处理主入口
 
-使用官方 SDK 的 WebSocket 长连接，无需公网域名
-支持用户白名单和权限确认
-支持 Docker 容器会话（通过 Claude 工具调用）
+Host-Guest 架构：
+
+1. 初始化 Redis 连接
+2. 启动 Host Bridge HTTP 服务
+3. WebSocket 接收飞书消息
+4. 通过 Redis 查找路由，转发到 Guest Proxy
+5. 处理权限确认流程
+
+架构：
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  WebSocket   │───►│ Redis Router │───►│ Guest Proxy  │
+│  (飞书消息)   │    │  (路由索引)   │    │ (容器内服务)  │
+└──────────────┘    └──────────────┘    └──────────────┘
+       │                                       │
+       │         ┌──────────────┐             │
+       └────────►│  Permission  │◄────────────┘
+                 │   Forwarder  │
+                 └──────────────┘
 """
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import os
-from dotenv import load_dotenv
-load_dotenv()  # 必须在导入其他模块之前加载
-
-# 取消 CLAUDECODE 环境变量，避免嵌套会话错误
-# (Bot 可能运行在 Claude Code 会话中)
-os.environ.pop('CLAUDECODE', None)
-
+import asyncio
 import json
 import logging
 import threading
 from queue import Queue
+from typing import Optional
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# 取消 CLAUDECODE 环境变量
+os.environ.pop('CLAUDECODE', None)
 
 import lark_oapi as lark
-from lark_oapi.adapter.flask import *
 from lark_oapi.api.im.v1 import *
 
-from src.config import is_authorized, get_permission_config, get_authorized_users
-from src.claude_code import chat_sync, set_permission_request_callback
-from src.feishu_utils.feishu_utils import send_message, reply_message, create_group_chat
-from src.data_base_utils import get_session, save_session
-from src.permission_manager import (
-    permission_manager,
-    format_permission_message,
+from src.config import (
+    is_authorized,
+    get_authorized_users,
+    get_redis_config,
+    get_host_bridge_config,
 )
+from src.redis_client import init_redis, redis_client
+from src.host_bridge import start_host_bridge, GuestProxyClient
+from src.host_bridge.server import HostBridgeServer
+from src.feishu_utils.feishu_utils import send_message, create_group_chat
+from src.permission_manager import format_permission_message
 from src.docker_session_manager import docker_session_manager
-from src.docker_mcp import set_docker_session_handler
-from src.context import set_request_context, clear_request_context
 from src.status_manager import StatusManager
+from src.protocol import PermissionParams
 
 APP_ID = os.getenv("APP_ID")
 APP_SECRET = os.getenv("APP_SECRET")
@@ -45,236 +62,144 @@ APP_SECRET = os.getenv("APP_SECRET")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 消息队列管理（每个 chat_id 一个队列，串行处理）
+# 消息队列管理
 _active_queues: dict[str, Queue] = {}
 _queue_lock = threading.Lock()
 
-# 正在等待权限确认的 chat_id
+# 权限确认状态
 _pending_permission_chats: set[str] = set()
 _pending_permission_lock = threading.Lock()
+_pending_permission_futures: dict[str, asyncio.Future] = {}
 
-# 正在等待 Docker 会话确认的 chat_id
-# {chat_id: {"container": "容器名", "user_open_id": "用户ID"}}
+# Docker 会话确认
 _pending_docker_confirm: dict[str, dict] = {}
 _pending_docker_lock = threading.Lock()
 
+# 全局 Host Bridge 服务
+_host_bridge: Optional[HostBridgeServer] = None
 
-def handle_permission_request(
-    chat_id: str,
-    session_id: str,
-    tool_name: str,
-    tool_input: dict
-) -> bool:
+
+async def handle_permission_request_from_guest(params: PermissionParams) -> bool:
     """
-    处理权限确认请求（在权限管理器中阻塞等待用户响应）
+    处理来自 Guest Proxy 的权限请求
 
     Args:
-        chat_id: 飞书聊天 ID
-        session_id: Claude Code 会话 ID
-        tool_name: 工具名称
-        tool_input: 工具输入参数
+        params: 权限请求参数
 
     Returns:
-        bool: True 表示用户允许，False 表示用户拒绝
+        是否允许
     """
-    # 发送确认请求到飞书
+    chat_id = params.chat_id
+    tool_name = params.tool_name
+    tool_input = params.tool_input
+
+    # 发送确认消息到飞书
     message = format_permission_message(tool_name, tool_input)
     send_message(chat_id, message)
 
-    # 标记该聊天正在等待权限确认
+    # 标记等待权限确认
     with _pending_permission_lock:
         _pending_permission_chats.add(chat_id)
 
+    # 创建 Future 等待用户响应
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
+    _pending_permission_futures[chat_id] = future
+
     try:
-        # 在权限管理器中等待用户响应
-        approved = permission_manager.request_permission(
-            session_id=session_id,
-            chat_id=chat_id,
-            tool_name=tool_name,
-            tool_input=tool_input,
-        )
+        # 等待用户响应（通过 handle_message 中的响应处理）
+        approved = await asyncio.wait_for(future, timeout=300)  # 5 分钟超时
         return approved
+    except asyncio.TimeoutError:
+        send_message(chat_id, "⏰ 权限确认超时")
+        return False
     finally:
-        # 清理标记
         with _pending_permission_lock:
             _pending_permission_chats.discard(chat_id)
+            _pending_permission_futures.pop(chat_id, None)
 
 
-def handle_docker_session_request(
-    chat_id: str,
-    user_open_id: str,
-    container_name: str
-) -> dict:
+async def handle_status_update(params):
+    """处理状态更新"""
+    chat_id = params.chat_id
+    status = params.status
+    details = params.details
+
+    # 发送状态消息到飞书
+    status_msg = f"📋 {status}"
+    if details:
+        status_msg += f": {details}"
+    send_message(chat_id, status_msg)
+
+
+def chat_with_guest_proxy(chat_id: str, message: str, user_open_id: str = None) -> str:
     """
-    处理 Docker 会话创建请求（由 MCP 工具调用触发）
+    转发消息到 Guest Proxy
 
-    Args:
-        chat_id: 飞书聊天 ID
-        user_open_id: 用户 open_id
-        container_name: 容器名称
-
-    Returns:
-        dict: {"success": bool, "message": str, "docker_chat_id": str|None}
+    流程：
+    1. 查找 Redis 路由
+    2. 转发到 Guest Proxy
+    3. 返回结果
     """
-    logger.info(f"收到 Docker 会话请求: {container_name} (from {chat_id[:8]}..., user={user_open_id[:8]}...)")
-
-    # 检查容器是否存在且运行
-    import subprocess
-    try:
-        check_cmd = ["docker", "inspect", "-f", "{{.State.Running}}", container_name]
-        result = subprocess.run(check_cmd, capture_output=True, text=True, timeout=10)
-        if result.returncode != 0 or result.stdout.strip() != "true":
-            return {
-                "success": False,
-                "message": f"容器 '{container_name}' 不存在或未运行"
-            }
-    except Exception as e:
-        return {
-            "success": False,
-            "message": f"检查容器状态失败: {e}"
-        }
-
-    # 发送确认请求到飞书
-    send_message(
-        chat_id,
-        f"🐳 创建容器会话: {container_name}\n\n"
-        f"是否创建专属容器会话？(y/n)\n"
-        f"创建后将在新群聊窗口进行容器内操作。"
-    )
-
-    # 等待用户确认（阻塞）
-    with _pending_docker_lock:
-        _pending_docker_confirm[chat_id] = {
-            "container": container_name,
-            "user_open_id": user_open_id,
-            "waiting": True,
-            "confirmed": None,
-        }
-
-    # 阻塞等待用户响应
-    import time
-    timeout = 300  # 5 分钟超时
-    start = time.time()
-    while time.time() - start < timeout:
-        with _pending_docker_lock:
-            pending = _pending_docker_confirm.get(chat_id)
-            if pending and pending.get("confirmed") is not None:
-                break
-        time.sleep(0.5)
-
-    with _pending_docker_lock:
-        pending = _pending_docker_confirm.pop(chat_id, {})
-
-    confirmed = pending.get("confirmed")
-    if confirmed is None:
-        return {
-            "success": False,
-            "message": "确认超时，请重新请求"
-        }
-
-    if not confirmed:
-        return {
-            "success": False,
-            "message": "用户拒绝创建容器会话"
-        }
-
-    # 用户确认，创建群聊会话
-    try:
-        group_name = f"🐳 {container_name} (Claude助手)"
-        docker_chat_id = create_group_chat(user_open_id, group_name)
-
-        # 保存 Docker 会话映射
-        docker_session_manager.create_docker_session(
-            original_chat_id=chat_id,
-            container_name=container_name,
-            user_open_id=user_open_id,
-            docker_chat_id=docker_chat_id
-        )
-
-        # 发送欢迎消息到新窗口
-        welcome_msg = f"🐳 已进入容器: {container_name}\n\n"
-        welcome_msg += "在此窗口发送的命令将在容器内执行。\n"
-        welcome_msg += "输入 /exit 退出容器会话。"
-        send_message(docker_chat_id, welcome_msg)
-
-        # 在原窗口通知
-        send_message(chat_id, f"✅ 已创建容器会话，请在新的群聊窗口继续操作。")
-
-        return {
-            "success": True,
-            "message": f"容器会话已创建，请在新的群聊窗口继续",
-            "docker_chat_id": docker_chat_id
-        }
-
-    except Exception as e:
-        logger.error(f"创建 Docker 会话失败: {e}")
-        return {
-            "success": False,
-            "message": f"创建容器会话失败: {e}"
-        }
-
-
-def chat_with_claude(chat_id: str, message: str, user_open_id: str = None) -> str:
-    """
-    调用 Claude Code，基于 chat_id 保持对话连续性
-    支持 Docker 容器会话
-    支持实时状态反馈
-    """
-    # 设置请求上下文（供 MCP 工具使用）
-    if user_open_id:
-        set_request_context(chat_id, user_open_id)
-
-    # 创建状态管理器
     status_mgr = StatusManager(chat_id)
+    status_mgr.send_status("⏳ 正在处理您的请求...")
 
     try:
-        # 从 SQLite 获取之前的 session_id
-        session_id = get_session(chat_id)
+        # 检查 Redis 路由
+        endpoint = redis_client.get_route(chat_id)
 
-        # 获取权限配置
-        perm_config = get_permission_config()
-        require_confirmation = perm_config.get("enabled", True)
+        if not endpoint:
+            # 没有路由，检查是否是 Docker 会话
+            container = docker_session_manager.get_container_for_chat(chat_id)
 
-        # 检查是否是 Docker 会话
-        container = docker_session_manager.get_container_for_chat(chat_id)
+            if container:
+                status_mgr.finalize(
+                    f"⚠️ 容器 {container} 的代理服务未就绪。\n"
+                    f"请确保容器内的 Guest Proxy 已启动并注册。"
+                )
+            else:
+                status_mgr.finalize(
+                    "⚠️ 当前会话未绑定到任何容器。\n"
+                    "请使用 Docker 容器会话功能。\n\n"
+                    "示例：发送「进入 xxx 容器」创建容器会话。"
+                )
+            return "无可用路由"
 
-        # 发送初始状态消息
-        status_mgr.send_status("⏳ 正在处理您的请求...")
+        # 有路由，转发到 Guest Proxy
+        logger.info(f"路由到 Guest Proxy: {endpoint}")
 
-        # 调用 Claude（带状态管理器）
-        reply, new_session_id = chat_sync(
-            message,
-            session_id=session_id,
-            chat_id=chat_id,
-            require_confirmation=require_confirmation,
-            container=container,
-            user_open_id=user_open_id,
-            status_manager=status_mgr,
-        )
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            async def _send():
+                async with GuestProxyClient() as client:
+                    result = await client.chat(
+                        endpoint=endpoint,
+                        message=message,
+                        chat_id=chat_id,
+                        user_open_id=user_open_id,
+                    )
+                    return result
 
-        # 替换状态消息为最终结果
-        status_mgr.finalize(reply)
+            result = loop.run_until_complete(_send())
+            reply = result.content
 
-        # 保存到 SQLite
-        if new_session_id != session_id:
-            save_session(chat_id, new_session_id)
-            logger.info(f"会话映射: {chat_id[:8]}... -> {new_session_id[:8]}...")
+            if result.session_id:
+                logger.info(f"会话: {chat_id[:8]}... -> {result.session_id[:8]}...")
 
-        return reply
+            status_mgr.finalize(reply)
+            return reply
+        finally:
+            loop.close()
+
     except Exception as e:
         logger.error(f"处理请求失败: {e}")
         status_mgr.finalize(f"❌ 执行出错: {e}")
         raise
-    finally:
-        # 清理请求上下文
-        clear_request_context()
 
 
-def _process_chat_queue(chat_id: str, message_id: str, chat_type: str, queue: Queue, user_open_id: str = None):
-    """
-    处理指定 chat_id 的消息队列（FIFO）
-    同一 chat_id 串行处理，不同 chat_id 可并行
-    """
+def _process_chat_queue(chat_id: str, queue: Queue, user_open_id: str = None):
+    """处理消息队列"""
     while True:
         with _queue_lock:
             if queue.empty():
@@ -283,20 +208,14 @@ def _process_chat_queue(chat_id: str, message_id: str, chat_type: str, queue: Qu
             text = queue.get_nowait()
 
         try:
-            reply = chat_with_claude(chat_id, text, user_open_id)
-            # 注意：chat_with_claude 内部通过 StatusManager.finalize() 已经发送了最终结果
-            # 这里不再重复发送
+            reply = chat_with_guest_proxy(chat_id, text, user_open_id)
             logger.info(f"回复: {reply[:100]}...")
         except Exception as e:
             logger.error(f"处理失败 [{chat_id[:8]}...]: {e}")
-            import traceback
-            traceback.print_exc()
 
 
-def enqueue_message(chat_id: str, message_id: str, text: str, chat_type: str, user_open_id: str = None):
-    """
-    将消息加入队列，无队列则创建
-    """
+def enqueue_message(chat_id: str, text: str, user_open_id: str = None):
+    """将消息加入队列"""
     with _queue_lock:
         if chat_id in _active_queues:
             _active_queues[chat_id].put(text)
@@ -306,7 +225,7 @@ def enqueue_message(chat_id: str, message_id: str, text: str, chat_type: str, us
             _active_queues[chat_id] = queue
             threading.Thread(
                 target=_process_chat_queue,
-                args=(chat_id, message_id, chat_type, queue, user_open_id),
+                args=(chat_id, queue, user_open_id),
                 daemon=True
             ).start()
 
@@ -316,8 +235,6 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
     try:
         event = data.event
         message = event.message
-        message_id = message.message_id
-
         sender_id = event.sender.sender_id.open_id
 
         content = json.loads(message.content)
@@ -351,7 +268,7 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
         lower_text = text.lower().strip()
 
-        # 检查是否是 Docker 会话确认响应
+        # 检查 Docker 会话确认响应
         with _pending_docker_lock:
             pending_docker = _pending_docker_confirm.get(chat_id)
 
@@ -367,31 +284,32 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                     _pending_docker_confirm[chat_id]["waiting"] = False
                 return
 
-        # 检查是否是退出容器会话命令
+        # 检查退出容器会话命令
         if is_docker and lower_text in ["/exit", "exit", "退出"]:
             original_chat_id = docker_session_manager.get_original_chat_id(chat_id)
             docker_session_manager.delete_docker_session(chat_id)
+            redis_client.delete_route(chat_id)
             send_message(chat_id, "👋 已退出容器会话。")
             if original_chat_id:
-                send_message(original_chat_id, f"容器会话已结束。")
+                send_message(original_chat_id, "容器会话已结束。")
             return
 
-        # 检查是否是权限确认响应
+        # 检查权限确认响应
         with _pending_permission_lock:
-            is_waiting_permission = chat_id in _pending_permission_chats
+            future = _pending_permission_futures.get(chat_id)
 
-        if is_waiting_permission:
+        if future and not future.done():
             if lower_text in ["y", "yes", "确认", "允许"]:
-                if permission_manager.submit_response(chat_id, True):
-                    send_message(chat_id, "✅ 已允许操作")
-                    return
+                future.set_result(True)
+                send_message(chat_id, "✅ 已允许操作")
+                return
             elif lower_text in ["n", "no", "拒绝", "取消"]:
-                if permission_manager.submit_response(chat_id, False):
-                    send_message(chat_id, "❌ 已拒绝操作")
-                    return
+                future.set_result(False)
+                send_message(chat_id, "❌ 已拒绝操作")
+                return
 
-        # 加入队列，按 chat_id 串行处理
-        enqueue_message(chat_id, message_id, text, message.chat_type, sender_id)
+        # 加入队列处理
+        enqueue_message(chat_id, text, sender_id)
 
     except Exception as e:
         logger.error(f"处理消息失败: {e}")
@@ -399,14 +317,24 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         traceback.print_exc()
 
 
-def main():
-    # 设置权限确认回调
-    set_permission_request_callback(handle_permission_request)
+async def async_main():
+    """异步主函数"""
+    global _host_bridge
 
-    # 设置 Docker 会话处理函数
-    set_docker_session_handler(handle_docker_session_request)
+    # 1. 初始化 Redis
+    if not init_redis():
+        logger.error("Redis 连接失败，服务无法启动")
+        return
 
-    # 创建客户端
+    # 2. 启动 Host Bridge HTTP 服务
+    bridge_config = get_host_bridge_config()
+    _host_bridge = await start_host_bridge(
+        port=bridge_config["port"],
+        on_permission_request=handle_permission_request_from_guest,
+        on_status_update=handle_status_update,
+    )
+
+    # 3. 创建 WebSocket 客户端
     client = lark.ws.Client(
         APP_ID,
         APP_SECRET,
@@ -418,7 +346,26 @@ def main():
 
     logger.info("启动飞书长连接...")
     logger.info(f"已配置授权用户数: {len(get_authorized_users())}")
-    client.start()
+    logger.info(f"Host Bridge 端口: {bridge_config['port']}")
+
+    # 4. 在后台线程运行 WebSocket
+    ws_thread = threading.Thread(target=client.start, daemon=True)
+    ws_thread.start()
+
+    # 主线程保持运行
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except KeyboardInterrupt:
+        logger.info("收到中断信号")
+    finally:
+        await _host_bridge.stop()
+        redis_client.close()
+
+
+def main():
+    """主入口"""
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":

@@ -58,17 +58,6 @@ def is_authorized(open_id: str) -> bool:
     return open_id in authorized
 
 
-def get_permission_config() -> dict:
-    """
-    获取权限确认配置
-
-    Returns:
-        dict: {"enabled": bool, "timeout": int}
-    """
-    config = load_config()
-    return config.get("permission", {"enabled": True, "timeout": 0})
-
-
 def get_authorized_users() -> List[str]:
     """获取授权用户列表"""
     config = load_config()
@@ -78,3 +67,53 @@ def get_authorized_users() -> List[str]:
     if isinstance(authorized, str):
         return [authorized]
     return list(authorized)
+
+
+def get_redis_config() -> dict:
+    """
+    获取 Redis 配置
+
+    Returns:
+        dict: {"url": str, "password": str|None}
+    """
+    config = load_config()
+    redis_config = config.get("redis", {})
+
+    # 环境变量优先
+    url = os.getenv("REDIS_URL") or redis_config.get("url", "redis://localhost:6379/0")
+    password = os.getenv("REDIS_PASSWORD") or redis_config.get("password")
+
+    return {
+        "url": url,
+        "password": password,
+    }
+
+
+def get_host_bridge_config() -> dict:
+    """
+    获取 Host Bridge 配置
+
+    Returns:
+        dict: {"port": int, "host": str}
+    """
+    config = load_config()
+    bridge_config = config.get("host_bridge", {})
+    return {
+        "port": bridge_config.get("port", 8080),
+        "host": bridge_config.get("host", "0.0.0.0"),
+    }
+
+
+def get_guest_proxy_config() -> dict:
+    """
+    获取 Guest Proxy 配置
+
+    Returns:
+        dict: {"port": int, "host_bridge_url": str}
+    """
+    config = load_config()
+    guest_config = config.get("guest_proxy", {})
+    return {
+        "port": guest_config.get("port", 8081),
+        "host_bridge_url": os.getenv("HOST_BRIDGE_URL") or guest_config.get("host_bridge_url", "http://host.docker.internal:8080"),
+    }

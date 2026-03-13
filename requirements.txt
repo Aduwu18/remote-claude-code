@@ -4,3 +4,5 @@ pycryptodome>=3.0.0
 python-dotenv>=1.0.0
 nest-asyncio>=1.5.0
 PyYAML>=6.0
+redis>=4.0.0
+aiohttp>=3.8.0

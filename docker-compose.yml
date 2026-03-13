@@ -1,0 +1,43 @@
+# Docker Compose 配置
+# 用于部署 Host Bridge + Redis + Guest Proxy
+
+version: '3.8'
+
+services:
+  # Redis 服务
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Host Bridge 服务
+  host-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.host-bridge
+    ports:
+      - "8080:8080"
+    environment:
+      - APP_ID=${APP_ID}
+      - APP_SECRET=${APP_SECRET}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+
+volumes:
+  redis_data:
+
+# Guest Proxy 需要在目标容器内单独部署
+# 使用 .devcontainer 注入或手动安装
