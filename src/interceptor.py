@@ -11,7 +11,13 @@
 - /start <name> - 创建容器会话
 - /stop - 退出当前容器会话
 - /help - 显示帮助
+
+自然语言命令（无需前缀）：
+- "进入 xxx 容器" / "进入 xxx" - 创建容器会话
+- "列出容器" / "查看容器" - 列出所有容器
+- "退出容器" / "退出" - 退出当前容器会话
 """
+import re
 import docker
 import logging
 from typing import Optional, Callable, Awaitable
@@ -86,20 +92,55 @@ class ProtocolInterceptor:
         """
         # 1. 快速判断是否有拦截标识
         message = message.strip()
+
+        # 2. 尝试匹配自然语言命令（无需前缀）
+        natural_result = self._try_natural_language(user_id, chat_id, message)
+        if natural_result is not None:
+            return natural_result
+
+        # 3. 检查命令前缀格式
         if not message.startswith(("/", "!")):
             return None
 
-        # 2. 解析命令和参数
+        # 4. 解析命令和参数
         parts = message.split()
         cmd = parts[0].lower()
         args = parts[1:] if len(parts) > 1 else []
 
-        # 3. 匹配处理器
+        # 5. 匹配处理器
         handler = self.handlers.get(cmd)
         if handler:
             return handler(user_id, chat_id, args)
 
         return "⚠️ 未知管理命令。发送 /help 查看可用命令。"
+
+    def _try_natural_language(
+        self,
+        user_id: str,
+        chat_id: str,
+        message: str
+    ) -> Optional[str]:
+        """
+        尝试解析自然语言命令
+
+        Returns:
+            如果匹配成功返回响应，否则返回 None
+        """
+        # 进入容器模式: "进入 xxx 容器" 或 "进入 xxx"
+        enter_match = re.match(r'^进入\s+(.+?)(?:\s+容器)?$', message)
+        if enter_match:
+            container_name = enter_match.group(1).strip()
+            return self._start_session(user_id, chat_id, [container_name])
+
+        # 列出容器: "列出容器" / "查看容器" / "显示容器"
+        if re.match(r'^(列出|查看|显示)容器$', message):
+            return self._list_containers(user_id, chat_id, [])
+
+        # 退出容器: "退出容器" / "退出" / "离开容器"
+        if re.match(r'^(退出|离开)(?:容器)?$', message):
+            return self._stop_session(user_id, chat_id, [])
+
+        return None
 
     def _list_containers(
         self,
@@ -181,14 +222,17 @@ class ProtocolInterceptor:
         """显示帮助信息"""
         return """📚 管理命令帮助
 
-**容器管理**
+**命令格式**
 /ls, /list - 列出所有容器
 /start <名称> - 进入容器会话
 /enter <名称> - 同上
 /stop, /exit - 退出当前容器会话
-
-**其他**
 /help, /? - 显示此帮助
+
+**自然语言**（无需前缀）
+进入 xxx 容器 - 进入容器会话
+列出容器 / 查看容器 - 显示容器列表
+退出容器 / 退出 - 退出当前会话
 
 💡 提示：在容器会话中，直接发送消息即可与 Claude 交互"""
 
