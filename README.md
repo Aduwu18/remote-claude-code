@@ -57,6 +57,18 @@
 
 ## 快速开始
 
+### 前置条件
+
+- Python 3.10+
+- Redis（本地或 Docker）
+- 飞书应用（需提前创建）
+
+### 步骤概览
+
+```
+1. 安装依赖 → 2. 配置环境变量 → 3. 启动 Redis → 4. 启动服务 → 5. 获取 open_id 并加入白名单
+```
+
 ### 1. 安装依赖
 
 ```bash
@@ -67,13 +79,16 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填入飞书应用的 APP_ID 和 APP_SECRET
 ```
+
+编辑 `.env`，填入飞书应用凭证：
 
 ```env
 APP_ID=cli_xxxxxx
 APP_SECRET=xxxxxx
 ```
+
+> **获取凭证**: 在 [飞书开放平台](https://open.feishu.cn/) 创建应用后获取
 
 ### 3. 配置用户白名单
 
@@ -81,12 +96,19 @@ APP_SECRET=xxxxxx
 cp config.example.yaml config.yaml
 ```
 
+**首次启动可先不配置白名单**，启动服务后在飞书发送消息，日志中会显示你的 `open_id`。
+
 编辑 `config.yaml`：
 
 ```yaml
 # 用户白名单（飞书 open_id）
 authorized_users:
-  - "ou_xxxxxx"
+  - "ou_xxxxxx"  # 替换为你的 open_id
+
+# 权限确认设置（可选）
+permission:
+  enabled: true   # 敏感操作需确认
+  timeout: 0      # 0 = 无限等待
 
 # Redis 配置
 redis:
@@ -95,53 +117,93 @@ redis:
 # Host Bridge 配置
 host_bridge:
   port: 8080
+  host: "0.0.0.0"
 
-# Guest Proxy 配置
+# Guest Proxy 配置（容器内运行时需要）
 guest_proxy:
   port: 8081
   host_bridge_url: "http://host.docker.internal:8080"
 ```
 
-### 4. 启动服务
-
-#### 方式一：Docker Compose（推荐）
+### 4. 启动 Redis
 
 ```bash
-# 启动 Redis + Host Bridge
+# 方式一：Docker（推荐）
+docker run -d -p 6379:6379 --name redis redis:7-alpine
+
+# 方式二：本地安装
+# macOS: brew install redis && brew services start redis
+# Ubuntu: sudo apt install redis-server && sudo systemctl start redis
+```
+
+验证 Redis：
+
+```bash
+redis-cli ping  # 应返回 PONG
+```
+
+### 5. 启动服务
+
+```bash
+# 前台运行（调试用）
+python -m src.main_websocket
+
+# 后台运行
+./start.sh
+
+# 停止服务
+./stop.sh
+
+# 查看日志
+tail -f log.log
+```
+
+### 6. 获取 open_id 并完成配置
+
+1. 在飞书中给机器人发送任意消息
+2. 查看日志，找到类似内容：
+   ```
+   sender_id: ou_xxxxxx
+   ```
+3. 将 `ou_xxxxxx` 添加到 `config.yaml` 的 `authorized_users`
+4. 重启服务：
+   ```bash
+   ./stop.sh && ./start.sh
+   ```
+
+### 7. 验证启动成功
+
+```bash
+# 检查服务状态
+ps aux | grep main_websocket
+
+# 检查日志无报错
+tail -20 log.log
+```
+
+在飞书中发送消息，机器人应正常回复。
+
+### Docker Compose 部署（可选）
+
+适合生产环境一键部署：
+
+```bash
 docker-compose up -d
 ```
 
-#### 方式二：手动部署
+> **注意**: 需要先配置 `.env` 和 `config.yaml`
 
-```bash
-# 1. 启动 Redis
-docker run -d -p 6379:6379 redis:7-alpine
-
-# 2. 启动 Host Bridge
-python -m src.main_websocket
-```
-
-### 5. 在目标容器内启动 Guest Proxy
-
-```bash
-# 安装依赖
-pip install claude-agent-sdk aiohttp redis
-
-# 设置环境变量
-export HOST_BRIDGE_URL=http://host.docker.internal:8080
-export CONTAINER_NAME=my-container
-
-# 启动
-python -m src.guest_proxy.server
-```
+---
 
 ## 飞书应用配置
 
+**首次使用必须完成以下配置：**
+
 1. 进入 [飞书开放平台](https://open.feishu.cn/)
 2. 创建应用，获取 APP_ID 和 APP_SECRET
-3. 事件订阅 → 选择"使用长连接接收事件"
-4. 添加事件：`im.message.receive_v1`
-5. 权限管理 → 添加以下权限
+3. **事件订阅** → 选择「使用长连接接收事件」
+4. **添加事件**: `im.message.receive_v1`
+5. **权限管理** → 添加以下权限：
 
 | 权限 | 说明 |
 |------|------|
@@ -151,6 +213,8 @@ python -m src.guest_proxy.server
 | `im:message:send_as_bot` | 以机器人身份发送消息 |
 | `im:message.group_at_msg:readonly` | 接收群聊 @ 消息 |
 | `im:message.group_msg` | 接收群聊所有消息 |
+
+6. **发布版本** - 添加权限后必须发布应用版本才能生效
 
 ## 使用示例
 
