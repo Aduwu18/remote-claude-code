@@ -59,145 +59,162 @@
 
 ### 前置条件
 
-- Python 3.10+
+- Python 3.11+
 - Redis（本地或 Docker）
 - 飞书应用（需提前创建）
+- 目标容器内 Python 3.11（与预编译 libs 匹配）
 
-### 步骤概览
+### 部署流程
 
 ```
-1. 安装依赖 → 2. 配置环境变量 → 3. 启动 Redis → 4. 启动服务 → 5. 获取 open_id 并加入白名单
+1. 部署 Host Bridge → 2. 配置目标容器 → 3. 启动服务
 ```
 
-### 1. 安装依赖
+---
+
+### 步骤 1：部署 Host Bridge（宿主机）
 
 ```bash
+# 安装依赖
 pip install -r requirements.txt
-```
 
-### 2. 配置环境变量
-
-```bash
+# 配置环境变量
 cp .env.example .env
-```
+# 编辑 .env，填入 APP_ID 和 APP_SECRET
 
-编辑 `.env`，填入飞书应用凭证：
-
-```env
-APP_ID=cli_xxxxxx
-APP_SECRET=xxxxxx
-```
-
-> **获取凭证**: 在 [飞书开放平台](https://open.feishu.cn/) 创建应用后获取
-
-### 3. 配置用户白名单
-
-```bash
+# 配置用户白名单
 cp config.example.yaml config.yaml
-```
+# 首次启动可暂不配置，从日志获取 open_id 后再添加
 
-**首次启动可先不配置白名单**，启动服务后在飞书发送消息，日志中会显示你的 `open_id`。
-
-编辑 `config.yaml`：
-
-```yaml
-# 用户白名单（飞书 open_id）
-authorized_users:
-  - "ou_xxxxxx"  # 替换为你的 open_id
-
-# 权限确认设置（可选）
-permission:
-  enabled: true   # 敏感操作需确认
-  timeout: 0      # 0 = 无限等待
-
-# Redis 配置
-redis:
-  url: "redis://localhost:6379/0"
-
-# Host Bridge 配置
-host_bridge:
-  port: 8080
-  host: "0.0.0.0"
-
-# Guest Proxy 配置（容器内运行时需要）
-guest_proxy:
-  port: 8081
-  host_bridge_url: "http://host.docker.internal:8080"
-```
-
-### 4. 启动 Redis
-
-```bash
-# 方式一：Docker（推荐）
+# 启动 Redis
 docker run -d -p 6379:6379 --name redis redis:7-alpine
 
-# 方式二：本地安装
-# macOS: brew install redis && brew services start redis
-# Ubuntu: sudo apt install redis-server && sudo systemctl start redis
-```
-
-验证 Redis：
-
-```bash
-redis-cli ping  # 应返回 PONG
-```
-
-### 5. 启动服务
-
-```bash
-# 前台运行（调试用）
-python -m src.main_websocket
-
-# 后台运行
+# 启动 Host Bridge
 ./start.sh
-
-# 停止服务
-./stop.sh
-
-# 查看日志
-tail -f log.log
 ```
 
-### 6. 获取 open_id 并完成配置
+验证启动：
+```bash
+tail -f log.log  # 查看日志
+ps aux | grep main_websocket  # 检查进程
+```
+
+---
+
+### 步骤 2：配置目标容器
+
+在目标容器的 `docker-compose.yml` 中添加：
+
+```yaml
+services:
+  your-service:
+    # ... 现有配置 ...
+
+    # 添加挂载（必须三个目录同时挂载）
+    volumes:
+      - ~/opt/claude-guest-proxy/src:/opt/guest-proxy/src:ro
+      - ~/opt/claude-guest-proxy/libs:/opt/guest-proxy/libs:ro
+      - ~/opt/claude-guest-proxy/start.sh:/opt/guest-proxy/start.sh:ro
+
+    # 添加环境变量
+    environment:
+      - HOST_BRIDGE_URL=http://host.docker.internal:8080
+      - GUEST_PROXY_PORT=8081
+      - CONTAINER_NAME=your-container-name
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+
+    # Linux 宿主机必需（让容器能访问宿主机）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+```
+
+**关键配置说明：**
+
+| 配置项 | 说明 |
+|--------|------|
+| `volumes` | 挂载预编译依赖和启动脚本 |
+| `extra_hosts` | Linux 必需，macOS/Windows 可省略 |
+| `HOST_BRIDGE_URL` | Host Bridge 地址，容器内访问宿主机 |
+| `Python 3.11` | 目标容器必须使用 Python 3.11（与预编译 libs 匹配） |
+
+---
+
+### 步骤 3：在容器内启动 Guest Proxy
+
+**重要：必须运行 `start.sh`，不能直接运行 `python -m`！**
+
+```bash
+# 进入容器
+docker exec -it your-container bash
+
+# 启动 Guest Proxy
+/opt/guest-proxy/start.sh
+```
+
+**为什么必须用 start.sh？**
+
+start.sh 会设置 `PYTHONPATH=/opt/guest-proxy/libs:/opt/guest-proxy/src`，让 Python 能找到预编译的依赖包。直接运行 `python -m guest_proxy.server` 会找不到依赖。
+
+---
+
+### 步骤 4：完成用户白名单配置
 
 1. 在飞书中给机器人发送任意消息
-2. 查看日志，找到类似内容：
-   ```
-   sender_id: ou_xxxxxx
-   ```
-3. 将 `ou_xxxxxx` 添加到 `config.yaml` 的 `authorized_users`
-4. 重启服务：
-   ```bash
-   ./stop.sh && ./start.sh
-   ```
+2. 查看日志，找到 `sender_id: ou_xxxxxx`
+3. 编辑 `config.yaml`，将 `ou_xxxxxx` 添加到 `authorized_users`
+4. 重启 Host Bridge：`./stop.sh && ./start.sh`
 
-### 7. 验证启动成功
+---
+
+### 验证部署
 
 ```bash
-# 检查服务状态
-ps aux | grep main_websocket
+# 1. 检查 Host Bridge
+curl http://localhost:8080/health
 
-# 检查日志无报错
-tail -20 log.log
+# 2. 检查 Guest Proxy（在容器内）
+curl http://localhost:8081/health
+
+# 3. 在飞书中发送消息测试
 ```
 
-在飞书中发送消息，机器人应正常回复。
+---
 
-### Docker Compose 部署（可选）
+### 进程管理（可选）
 
-适合生产环境一键部署：
-
-```bash
-docker-compose up -d
+**Supervisor 配置：**
+```ini
+[program:guest-proxy]
+command=/opt/guest-proxy/start.sh
+directory=/opt/guest-proxy
+autostart=true
+autorestart=true
+stderr_logfile=/var/log/guest-proxy.err.log
+stdout_logfile=/var/log/guest-proxy.out.log
+environment=HOST_BRIDGE_URL="http://host.docker.internal:8080"
 ```
 
-> **注意**: 需要先配置 `.env` 和 `config.yaml`
+**嵌入应用启动：**
+```python
+import asyncio
+from guest_proxy.server import GuestProxyServer
+
+async def main():
+    server = GuestProxyServer()
+    await server.start()
+    # 继续应用逻辑...
+```
 
 ---
 
 ## 飞书应用配置
-
-**首次使用必须完成以下配置：**
 
 1. 进入 [飞书开放平台](https://open.feishu.cn/)
 2. 创建应用，获取 APP_ID 和 APP_SECRET
@@ -305,29 +322,7 @@ docs/                        # 文档
 - Redis（路由索引）
 - aiohttp（HTTP 服务）
 
-## 可插拔集成
+## 更多文档
 
-将 Guest Proxy 集成到现有开发环境，详见 [集成文档](docs/GUEST_PROXY_INTEGRATION.md)。
-
-**快速集成：**
-
-```bash
-# 1. 复制模块到目标项目
-cp -r src/guest_proxy src/protocol /your-project/src/
-
-# 2. 安装依赖
-pip install -r deploy/requirements-guest-proxy.txt
-
-# 3. 设置环境变量
-export HOST_BRIDGE_URL=http://host.docker.internal:8080
-export ANTHROPIC_API_KEY=your-key
-
-# 4. 启动
-./deploy/start-guest-proxy.sh
-```
-
-**Docker Compose 集成：**
-
-```bash
-docker-compose -f docker-compose.yml -f deploy/docker-compose.guest-proxy.yml up -d
-```
+- [Guest Proxy 集成指南](docs/GUEST_PROXY_INTEGRATION.md) - 详细的容器集成配置
+- [部署配置](deploy/README.md) - Docker Compose 和 Dockerfile 模板
