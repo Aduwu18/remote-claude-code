@@ -96,6 +96,14 @@ class GuestProxyClient:
                 f"{endpoint}/rpc",
                 json=request.to_dict(),
             ) as response:
+                if response.status == 413:
+                    # Request body too large
+                    logger.error(f"Guest Proxy 请求体过大 (413): 消息长度 {len(message)}")
+                    return ChatResult(
+                        content="消息过长，请缩短内容后重试",
+                        status="failed",
+                        session_id="",
+                    )
                 if response.status != 200:
                     text = await response.text()
                     logger.error(f"Guest Proxy 请求失败: {response.status} - {text}")

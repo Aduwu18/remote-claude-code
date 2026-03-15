@@ -69,8 +69,8 @@ class GuestProxyServer:
         )
         watchdog.start()
 
-        # 创建 aiohttp 应用
-        self._app = web.Application()
+        # 创建 aiohttp 应用 (10MB max body size for long messages)
+        self._app = web.Application(client_max_size=10 * 1024 * 1024)
         self._app.router.add_post("/rpc", self._handle_rpc)
         self._app.router.add_get("/health", self._handle_health)
 
