@@ -138,7 +138,7 @@ class JsonRpcResponse:
         return cls(id=request_id, result=result)
 
     @classmethod
-    def error(cls, request_id: str, code: int, message: str) -> 'JsonRpcResponse':
+    def create_error(cls, request_id: str, code: int, message: str) -> 'JsonRpcResponse':
         return cls(id=request_id, error={"code": code, "message": message})
 
 

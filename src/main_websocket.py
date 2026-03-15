@@ -110,7 +110,35 @@ async def create_docker_session_handler(
             docker_chat_id=docker_chat_id
         )
 
-        # 3. 发送欢迎消息到新群聊
+        # 3. 设置 Redis 路由（关键！）
+        # 通过 Docker API 获取容器的端口映射
+        import docker
+        try:
+            client = docker.from_env()
+            container = client.containers.get(container_name)
+            # 获取端口映射
+            ports = container.attrs.get('NetworkSettings', {}).get('Ports', {})
+
+            # 尝试匹配 Guest Proxy 端口（格式为 "8081/tcp"）
+            endpoint = None
+            for port_key, bindings in ports.items():
+                if bindings and "8081" in port_key:
+                    host_port = bindings[0]['HostPort']
+                    endpoint = f"http://localhost:{host_port}"
+                    break
+
+            if not endpoint:
+                endpoint = f"http://localhost:8081"
+
+            # 设置路由
+            redis_client.set_route(docker_chat_id, endpoint)
+            logger.info(f"设置路由: {docker_chat_id[:8]}... -> {endpoint}")
+
+        except Exception as e:
+            logger.warning(f"获取容器端口失败: {e}，使用默认端口")
+            redis_client.set_route(docker_chat_id, f"http://localhost:8081")
+
+        # 4. 发送欢迎消息到新群聊
         welcome_msg = f"""🚀 已连接到容器 **{container_name}**
 
 现在你可以在这个群聊中与 Claude 交互，执行容器内的操作。
@@ -121,7 +149,7 @@ async def create_docker_session_handler(
 
         send_message(docker_chat_id, welcome_msg)
 
-        # 4. 通知原会话
+        # 5. 通知原会话
         send_message(
             original_chat_id,
             f"✅ 已创建容器会话\n"

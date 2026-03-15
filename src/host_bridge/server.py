@@ -114,7 +114,7 @@ class HostBridgeServer:
             handler = self._get_handler(rpc_request.method)
             if handler is None:
                 return web.json_response(
-                    JsonRpcResponse.error(
+                    JsonRpcResponse.create_error(
                         rpc_request.id,
                         ErrorCode.METHOD_NOT_FOUND,
                         f"Method not found: {rpc_request.method}"
@@ -128,12 +128,12 @@ class HostBridgeServer:
 
         except json.JSONDecodeError:
             return web.json_response(
-                JsonRpcResponse.error("", ErrorCode.PARSE_ERROR, "Parse error").to_dict()
+                JsonRpcResponse.create_error("", ErrorCode.PARSE_ERROR, "Parse error").to_dict()
             )
         except Exception as e:
             logger.error(f"RPC 处理异常: {e}")
             return web.json_response(
-                JsonRpcResponse.error("", ErrorCode.INTERNAL_ERROR, str(e)).to_dict()
+                JsonRpcResponse.create_error("", ErrorCode.INTERNAL_ERROR, str(e)).to_dict()
             )
 
     async def _handle_permission_response(self, request: web.Request) -> web.Response:
