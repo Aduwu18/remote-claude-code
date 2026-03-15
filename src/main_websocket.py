@@ -42,6 +42,9 @@ os.environ.pop('CLAUDECODE', None)
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
+from lark_oapi.event.callback.model.p2_card_action_trigger import (
+    P2CardActionTrigger, P2CardActionTriggerResponse
+)
 
 from src.config import (
     is_authorized,
@@ -52,8 +55,8 @@ from src.config import (
 from src.redis_client import init_redis, redis_client
 from src.host_bridge import start_host_bridge, GuestProxyClient
 from src.host_bridge.server import HostBridgeServer
-from src.feishu_utils.feishu_utils import send_message, create_group_chat
-from src.permission_manager import format_permission_message
+from src.feishu_utils.feishu_utils import send_message, create_group_chat, send_card_message
+from src.permission_manager import format_permission_message, build_permission_card_json
 from src.docker_session_manager import docker_session_manager
 from src.status_manager import StatusManager
 from src.protocol import PermissionParams
@@ -231,10 +234,17 @@ async def handle_permission_request_from_guest(params: PermissionParams) -> bool
     chat_id = params.chat_id
     tool_name = params.tool_name
     tool_input = params.tool_input
+    session_id = getattr(params, 'session_id', None)
 
-    # 发送确认消息到飞书
-    message = format_permission_message(tool_name, tool_input)
-    send_message(chat_id, message)
+    # 发送权限确认卡片到飞书
+    card = build_permission_card_json(tool_name, tool_input, chat_id, session_id)
+    res = send_card_message(chat_id, card)
+
+    if res.get("code") != 0:
+        # 降级为文本消息
+        logger.warning(f"发送权限卡片失败，降级为文本: {res}")
+        message = format_permission_message(tool_name, tool_input)
+        send_message(chat_id, message)
 
     # 标记等待权限确认
     with _pending_permission_lock:
@@ -246,7 +256,7 @@ async def handle_permission_request_from_guest(params: PermissionParams) -> bool
     _pending_permission_futures[chat_id] = future
 
     try:
-        # 等待用户响应（通过 handle_message 中的响应处理）
+        # 等待用户响应（通过 handle_card_action 或 handle_message 中的响应处理）
         approved = await asyncio.wait_for(future, timeout=300)  # 5 分钟超时
         return approved
     except asyncio.TimeoutError:
@@ -506,6 +516,75 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         traceback.print_exc()
 
 
+def handle_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+    """
+    处理卡片按钮点击回调
+
+    飞书卡片按钮点击后会触发此回调，通过 WebSocket 长连接接收。
+    前置条件：飞书开放平台已订阅「卡片回传交互」事件。
+    """
+    try:
+        event = data.event
+        action_value = event.action.value  # 按钮自定义值
+        operator_open_id = event.operator.open_id  # 点击用户的 open_id
+        chat_id = event.context.open_chat_id  # 聊天 ID
+        message_id = event.context.open_message_id  # 消息 ID
+
+        logger.info(f"卡片按钮点击 [{operator_open_id}]: {action_value}")
+
+        # 解析动作类型
+        action_type = action_value.get("action")
+
+        if action_type == "permission_approve":
+            # 处理权限确认 - 允许
+            with _pending_permission_lock:
+                future = _pending_permission_futures.get(chat_id)
+
+            if future and not future.done():
+                future.set_result(True)
+                logger.info(f"权限确认: 允许 [{chat_id[:8]}...]")
+
+                # 返回 Toast 提示
+                return P2CardActionTriggerResponse({
+                    "toast": {"type": "success", "content": "✅ 已允许操作"}
+                })
+            else:
+                return P2CardActionTriggerResponse({
+                    "toast": {"type": "error", "content": "⚠️ 操作已过期"}
+                })
+
+        elif action_type == "permission_deny":
+            # 处理权限确认 - 拒绝
+            with _pending_permission_lock:
+                future = _pending_permission_futures.get(chat_id)
+
+            if future and not future.done():
+                future.set_result(False)
+                logger.info(f"权限确认: 拒绝 [{chat_id[:8]}...]")
+
+                return P2CardActionTriggerResponse({
+                    "toast": {"type": "error", "content": "❌ 已拒绝操作"}
+                })
+            else:
+                return P2CardActionTriggerResponse({
+                    "toast": {"type": "error", "content": "⚠️ 操作已过期"}
+                })
+
+        else:
+            logger.warning(f"未知的卡片动作: {action_type}")
+            return P2CardActionTriggerResponse({
+                "toast": {"type": "error", "content": "⚠️ 未知操作"}
+            })
+
+    except Exception as e:
+        logger.error(f"处理卡片回调失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return P2CardActionTriggerResponse({
+            "toast": {"type": "error", "content": "❌ 处理失败"}
+        })
+
+
 async def async_main():
     """异步主函数"""
     global _host_bridge
@@ -545,6 +624,7 @@ async def async_main():
         APP_SECRET,
         event_handler=lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(handle_message)
+            .register_p2_card_action_trigger(handle_card_action)
             .build(),
         log_level=lark.LogLevel.INFO,
     )

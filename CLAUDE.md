@@ -89,6 +89,8 @@ permission:
 | `src/permission_manager.py` | Permission confirmation state management |
 | `src/config.py` | Configuration loading (YAML + env vars) and user authorization |
 | `src/feishu_utils/feishu_utils.py` | Feishu API utilities (send/reply messages, create group chats) |
+| `src/feishu_utils/card_builder.py` | Card message builder (interactive cards, buttons, status updates) |
+| `src/status_manager.py` | Status message management with card-based in-place updates |
 
 ### Request Flow
 
@@ -242,14 +244,16 @@ Guest Proxy detects sensitive tool
        ↓
 HTTP POST to Host Bridge /rpc (method: permission)
        ↓
-Host Bridge sends message to Feishu
+Host Bridge sends card to Feishu with Approve/Deny buttons
        ↓
-User replies "y"/"n"
+User clicks button OR replies "y"/"n"
        ↓
 Host Bridge resolves Future
        ↓
 Guest Proxy receives approved/denied
 ```
+
+**Card-based Confirmation**: Permission requests now use interactive card messages with clickable buttons. Text fallback ("y"/"n") is still supported for compatibility.
 
 ### 6. Redis Route Management
 
@@ -269,6 +273,20 @@ redis_client.delete_route(chat_id)
 - Group chat: Use `reply_message(message_id, text)` to reply to specific message
 - Private chat: Use `send_message(chat_id, text)` for direct message
 - Create group: `create_group_chat(user_open_id, group_name)`
+- **Card messages**: Use `send_card_message()`, `update_card_message()` for interactive cards
+- **Card builder**: Use `CardBuilder` class or helper functions in `card_builder.py`
+
+### 8. Status Manager
+
+Status updates use card messages with in-place updates via PATCH API:
+
+```python
+status_mgr = StatusManager(chat_id, use_card=True)
+status_mgr.send_status("Processing...")      # Send initial card
+status_mgr.update_status("Reading files...")  # Update in-place
+status_mgr.finalize("Task completed!")        # Final result (green header)
+status_mgr.finalize_error("Error occurred")   # Error result (red header)
+```
 
 ## Claude Code Configuration
 
@@ -337,7 +355,8 @@ python test/test_docker_session.py
 │   │   └── config.py          # Configuration
 │   └── feishu_utils/          # Feishu API helpers
 │       ├── __init__.py
-│       └── feishu_utils.py
+│       ├── feishu_utils.py    # Message API functions
+│       └── card_builder.py    # Card message builder
 ├── data/
 │   └── docker_sessions.db     # Docker session mappings (auto-created)
 ├── test/

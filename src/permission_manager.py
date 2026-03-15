@@ -2,12 +2,19 @@
 权限确认管理器
 
 管理 Claude Code 的权限请求与飞书端的用户确认交互
+
+特性：
+- 使用卡片消息展示权限请求
+- 支持按钮点击确认（通过 WebSocket 卡片回调）
+- 兼容文本回复确认
 """
 import json
 import threading
 import time
 from typing import Optional, Callable
 from dataclasses import dataclass, field
+
+from src.feishu_utils.card_builder import build_permission_card
 
 
 @dataclass
@@ -154,7 +161,7 @@ permission_manager = PermissionManager()
 
 def format_permission_message(tool_name: str, tool_input: dict) -> str:
     """
-    格式化权限确认消息
+    格式化权限确认消息（文本格式，用于降级场景）
 
     Args:
         tool_name: 工具名称
@@ -177,3 +184,24 @@ def format_permission_message(tool_name: str, tool_input: dict) -> str:
 请回复:
 • "y" 或 "确认" - 允许执行
 • "n" 或 "拒绝" - 拒绝执行"""
+
+
+def build_permission_card_json(
+    tool_name: str,
+    tool_input: dict,
+    chat_id: str,
+    session_id: Optional[str] = None
+) -> dict:
+    """
+    构建权限确认卡片 JSON
+
+    Args:
+        tool_name: 工具名称
+        tool_input: 工具输入参数
+        chat_id: 聊天 ID
+        session_id: 可选的会话 ID
+
+    Returns:
+        卡片 JSON（可直接传给 send_card_message）
+    """
+    return build_permission_card(tool_name, tool_input, chat_id, session_id)

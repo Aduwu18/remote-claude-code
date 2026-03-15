@@ -171,3 +171,103 @@ def send_message_with_id(receive_id: str, text: str, access_token=None) -> dict:
 
     res = requests.post(url, headers=get_headers(access_token), json=body, params=param)
     return res.json()
+
+
+def send_card_message(receive_id: str, card_content: dict, access_token=None) -> dict:
+    """
+    发送卡片消息
+
+    API: POST /im/v1/messages
+    文档: https://open.feishu.cn/document/server-docs/im-v1/message/create
+
+    Args:
+        receive_id: 接收者 ID (chat_id)
+        card_content: 卡片内容（使用 card_builder 构建的 JSON）
+        access_token: 访问令牌（可选）
+
+    Returns:
+        dict: API 响应
+    """
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    url = 'https://open.feishu.cn/open-apis/im/v1/messages'
+    param = {'receive_id_type': 'chat_id'}
+
+    body = {
+        'receive_id': receive_id,
+        "msg_type": "interactive",
+        "content": json.dumps(card_content, ensure_ascii=False),
+        'uuid': str(datetime.datetime.now().timestamp())
+    }
+
+    res = requests.post(url, headers=get_headers(access_token), json=body, params=param)
+    return res.json()
+
+
+def send_card_message_with_id(receive_id: str, card_content: dict, access_token=None) -> dict:
+    """
+    发送卡片消息并返回完整响应（包含 message_id）
+
+    Args:
+        receive_id: 接收者 ID (chat_id)
+        card_content: 卡片内容（使用 card_builder 构建的 JSON）
+        access_token: 访问令牌（可选）
+
+    Returns:
+        dict: API 响应，包含 {"code": 0, "data": {"message_id": "xxx"}}
+    """
+    return send_card_message(receive_id, card_content, access_token)
+
+
+def update_card_message(message_id: str, card_content: dict, access_token=None) -> dict:
+    """
+    更新已发送的卡片消息
+
+    API: PATCH /im/v1/messages/:message_id
+    文档: https://open.feishu.cn/document/server-docs/im-v1/message/update
+
+    Args:
+        message_id: 消息 ID
+        card_content: 新的卡片内容
+        access_token: 访问令牌（可选）
+
+    Returns:
+        dict: API 响应
+    """
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    url = f'https://open.feishu.cn/open-apis/im/v1/messages/{message_id}'
+    body = {
+        "msg_type": "interactive",
+        "content": json.dumps(card_content, ensure_ascii=False)
+    }
+    res = requests.patch(url, headers=get_headers(access_token), json=body)
+    return res.json()
+
+
+def reply_card_message(message_id: str, card_content: dict, access_token=None) -> dict:
+    """
+    回复消息（卡片形式）
+
+    Args:
+        message_id: 被回复的消息 ID
+        card_content: 卡片内容
+        access_token: 访问令牌（可选）
+
+    Returns:
+        dict: API 响应
+    """
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    url = f'https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply'
+
+    body = {
+        "msg_type": "interactive",
+        "content": json.dumps(card_content, ensure_ascii=False),
+        'uuid': str(datetime.datetime.now().timestamp())
+    }
+    res = requests.post(url, headers=get_headers(access_token), json=body)
+    return res.json()
