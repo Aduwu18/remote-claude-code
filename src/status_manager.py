@@ -16,7 +16,9 @@ from typing import Optional
 from src.feishu_utils.feishu_utils import (
     send_card_message_with_id,
     update_card_message,
-    send_message
+    send_message,
+    send_long_markdown_message,
+    FEISHU_CARD_MD_MAX_LENGTH,
 )
 from src.feishu_utils.card_builder import build_status_card, build_markdown_card
 
@@ -147,6 +149,8 @@ class StatusManager:
         """
         发送最终结果（更新现有卡片或发送新卡片）
 
+        支持长消息自动分块发送。
+
         Args:
             final_text: 最终结果文本
             title: 结果标题（默认"完成"）
@@ -158,43 +162,62 @@ class StatusManager:
             self._is_finalized = True
 
             try:
-                if self._use_card and self._message_id:
-                    # 更新现有卡片为最终结果
-                    card = build_markdown_card(
-                        title=f"✅ {title}",
-                        content=final_text,
-                        header_template="green"
-                    )
-                    res = update_card_message(self._message_id, card)
+                # 检查消息长度，决定是否分块发送
+                if len(final_text) > FEISHU_CARD_MD_MAX_LENGTH:
+                    # 长消息：更新状态卡片为"完成"提示，然后分块发送内容
+                    if self._use_card and self._message_id:
+                        # 更新状态卡片为简短提示
+                        card = build_markdown_card(
+                            title=f"✅ {title}",
+                            content="内容较长，已分多条消息发送 👇",
+                            header_template="green"
+                        )
+                        update_card_message(self._message_id, card)
 
-                    if res.get("code") != 0:
-                        logger.warning(f"更新最终结果卡片失败: {res}")
-                        # 降级为发送新消息
-                        send_message(self.chat_id, final_text)
+                    # 分块发送完整内容
+                    send_long_markdown_message(self.chat_id, final_text, title="")
+                    logger.debug(f"发送长消息结果，长度: {len(final_text)}")
                 else:
-                    # 发送新的卡片或文本
-                    if self._use_card:
+                    # 短消息：正常处理
+                    if self._use_card and self._message_id:
+                        # 更新现有卡片为最终结果
                         card = build_markdown_card(
                             title=f"✅ {title}",
                             content=final_text,
                             header_template="green"
                         )
-                        send_card_message_with_id(self.chat_id, card)
+                        res = update_card_message(self._message_id, card)
+
+                        if res.get("code") != 0:
+                            logger.warning(f"更新最终结果卡片失败: {res}")
+                            # 降级为发送新消息
+                            send_message(self.chat_id, final_text)
                     else:
-                        send_message(self.chat_id, final_text)
+                        # 发送新的卡片或文本
+                        if self._use_card:
+                            card = build_markdown_card(
+                                title=f"✅ {title}",
+                                content=final_text,
+                                header_template="green"
+                            )
+                            send_card_message_with_id(self.chat_id, card)
+                        else:
+                            send_message(self.chat_id, final_text)
 
                 logger.debug("发送最终结果")
             except Exception as e:
                 logger.error(f"发送最终结果失败: {e}")
                 # 最后的降级：发送纯文本
                 try:
-                    send_message(self.chat_id, final_text)
+                    send_long_markdown_message(self.chat_id, final_text, title="")
                 except Exception:
                     pass
 
     def finalize_error(self, error_text: str, title: str = "执行出错"):
         """
         发送错误结果
+
+        支持长消息自动分块发送。
 
         Args:
             error_text: 错误信息
@@ -207,30 +230,44 @@ class StatusManager:
             self._is_finalized = True
 
             try:
-                if self._use_card and self._message_id:
-                    card = build_markdown_card(
-                        title=f"❌ {title}",
-                        content=error_text,
-                        header_template="red"
-                    )
-                    res = update_card_message(self._message_id, card)
+                # 检查消息长度
+                if len(error_text) > FEISHU_CARD_MD_MAX_LENGTH:
+                    # 长错误消息：更新状态卡片，然后分块发送
+                    if self._use_card and self._message_id:
+                        card = build_markdown_card(
+                            title=f"❌ {title}",
+                            content="错误信息较长，已分多条消息发送 👇",
+                            header_template="red"
+                        )
+                        update_card_message(self._message_id, card)
 
-                    if res.get("code") != 0:
-                        send_message(self.chat_id, f"❌ {error_text}")
+                    # 分块发送错误内容
+                    send_long_markdown_message(self.chat_id, error_text, title="")
                 else:
-                    if self._use_card:
+                    if self._use_card and self._message_id:
                         card = build_markdown_card(
                             title=f"❌ {title}",
                             content=error_text,
                             header_template="red"
                         )
-                        send_card_message_with_id(self.chat_id, card)
+                        res = update_card_message(self._message_id, card)
+
+                        if res.get("code") != 0:
+                            send_message(self.chat_id, f"❌ {error_text}")
                     else:
-                        send_message(self.chat_id, f"❌ {error_text}")
+                        if self._use_card:
+                            card = build_markdown_card(
+                                title=f"❌ {title}",
+                                content=error_text,
+                                header_template="red"
+                            )
+                            send_card_message_with_id(self.chat_id, card)
+                        else:
+                            send_message(self.chat_id, f"❌ {error_text}")
 
             except Exception as e:
                 logger.error(f"发送错误结果失败: {e}")
                 try:
-                    send_message(self.chat_id, f"❌ {error_text}")
+                    send_long_markdown_message(self.chat_id, error_text, title="")
                 except Exception:
                     pass

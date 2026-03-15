@@ -305,3 +305,158 @@ def reply_card_message(message_id: str, card_content: dict, access_token=None) -
     }
     res = requests.post(url, headers=get_headers(access_token), json=body)
     return res.json()
+
+
+# ==================== 消息分块常量 ====================
+# 飞书消息长度限制
+FEISHU_TEXT_MAX_LENGTH = 30000      # 文本消息约 30KB
+FEISHU_CARD_MD_MAX_LENGTH = 10000   # 卡片 Markdown 单元素约 10KB
+FEISHU_CARD_TOTAL_MAX_LENGTH = 80000  # 卡片总 JSON 约 100KB，保守取 80KB
+
+
+def split_long_message(text: str, max_length: int = FEISHU_CARD_MD_MAX_LENGTH) -> list[str]:
+    """
+    将长消息分割为多个片段
+
+    优先在自然边界（空行、换行）处分割，保持消息可读性。
+
+    Args:
+        text: 原始消息文本
+        max_length: 每段最大长度
+
+    Returns:
+        list[str]: 分割后的消息片段列表
+    """
+    if len(text) <= max_length:
+        return [text]
+
+    chunks = []
+    remaining = text
+
+    while remaining:
+        if len(remaining) <= max_length:
+            chunks.append(remaining)
+            break
+
+        # 在 max_length 附近寻找最佳分割点
+        # 优先级：双换行 > 单换行 > 空格 > 强制截断
+        search_start = max(0, max_length - 500)  # 在 max_length 前 500 字符内寻找分割点
+        search_end = min(max_length, len(remaining))  # 不超过实际长度
+        search_text = remaining[search_start:search_end]
+
+        best_split = -1
+
+        # 1. 优先在双换行（段落边界）分割
+        double_newline = search_text.rfind('\n\n')
+        if double_newline != -1:
+            best_split = search_start + double_newline + 2
+        else:
+            # 2. 在单换行分割
+            single_newline = search_text.rfind('\n')
+            if single_newline != -1:
+                best_split = search_start + single_newline + 1
+            else:
+                # 3. 在空格分割
+                space = search_text.rfind(' ')
+                if space != -1:
+                    best_split = search_start + space + 1
+                else:
+                    # 4. 强制截断
+                    best_split = max_length
+
+        # 确保分割点不超过 max_length
+        if best_split > max_length:
+            best_split = max_length
+
+        chunk = remaining[:best_split].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        # 更新剩余文本，如果分割点等于剩余长度则结束
+        if best_split >= len(remaining):
+            break
+        remaining = remaining[best_split:].strip()
+
+    return chunks
+
+
+def send_long_message(
+    receive_id: str,
+    text: str,
+    title: str = "",
+    use_card: bool = True,
+    access_token=None
+) -> list[dict]:
+    """
+    发送长消息，自动分块
+
+    当消息超过飞书限制时，自动分割为多条消息发送。
+
+    Args:
+        receive_id: 接收者 ID (chat_id)
+        text: 消息内容
+        title: 可选的卡片标题（仅第一条消息使用）
+        use_card: 是否使用卡片模式
+        access_token: 访问令牌（可选）
+
+    Returns:
+        list[dict]: 所有消息的 API 响应列表
+    """
+    max_length = FEISHU_CARD_MD_MAX_LENGTH if use_card else FEISHU_TEXT_MAX_LENGTH
+    chunks = split_long_message(text, max_length)
+
+    responses = []
+    total = len(chunks)
+
+    for i, chunk in enumerate(chunks):
+        if use_card:
+            from src.feishu_utils.card_builder import CardBuilder
+
+            builder = CardBuilder()
+
+            # 只有第一条消息带标题
+            if i == 0 and title:
+                builder.set_header(title, "blue")
+
+            # 添加分页提示（如果有多条）
+            if total > 1:
+                chunk_text = f"{chunk}\n\n---\n📄 {i + 1}/{total}"
+            else:
+                chunk_text = chunk
+
+            builder.add_div(chunk_text, "lark_md")
+            card = builder.build()
+
+            res = send_card_message(receive_id, card, access_token)
+        else:
+            # 文本模式
+            if total > 1:
+                chunk_text = f"{chunk}\n\n---\n📄 {i + 1}/{total}"
+            else:
+                chunk_text = chunk
+            res = send_message(receive_id, chunk_text, access_token)
+
+        responses.append(res)
+
+    return responses
+
+
+def send_long_markdown_message(
+    receive_id: str,
+    text: str,
+    title: str = "",
+    access_token=None
+) -> list[dict]:
+    """
+    发送长 Markdown 消息（使用卡片渲染），自动分块
+
+    Args:
+        receive_id: 接收者 ID (chat_id)
+        text: Markdown 内容
+        title: 可选的卡片标题
+        access_token: 访问令牌（可选）
+
+    Returns:
+        list[dict]: 所有消息的 API 响应列表
+    """
+    return send_long_message(receive_id, text, title, use_card=True, access_token=access_token)
