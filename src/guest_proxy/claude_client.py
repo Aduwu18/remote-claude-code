@@ -5,11 +5,12 @@ Claude Code 客户端封装（Guest Proxy 版本）
 - 通过 HTTP 向 Host Bridge 发送权限请求
 - 支持环境继承
 - 会话由 SDK 原生持久化
+- 支持流式响应
 """
 import asyncio
 import logging
 import aiohttp
-from typing import Optional, Callable
+from typing import Optional, Callable, AsyncGenerator
 from dataclasses import dataclass
 
 from claude_agent_sdk import (
@@ -22,6 +23,7 @@ from claude_agent_sdk import (
 )
 
 from src.guest_proxy.config import get_guest_config, get_container_env
+from src.protocol import StreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +175,62 @@ class GuestClaudeClient:
             content="\n".join(response_text),
             tool_calls=tool_calls,
             session_id=self.session_id or "",
+        )
+
+    async def chat_stream(self, message: str) -> AsyncGenerator[StreamEvent, None]:
+        """
+        流式发送消息，yield 状态事件
+
+        Args:
+            message: 用户消息
+
+        Yields:
+            StreamEvent: 流式事件（状态、工具调用、内容、完成等）
+        """
+        if not self._client:
+            await self.connect()
+
+        # 发送初始状态
+        yield StreamEvent.status("正在处理您的请求...")
+
+        await self._client.query(message)
+
+        response_text = []
+        tool_calls = []
+
+        async for msg in self._client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        # 内容片段
+                        response_text.append(block.text)
+                        yield StreamEvent.content(block.text)
+
+                    elif isinstance(block, ToolUseBlock):
+                        tool_info = {
+                            "id": block.id,
+                            "name": block.name,
+                            "input": block.input,
+                        }
+                        tool_calls.append(tool_info)
+
+                        # 工具调用状态
+                        yield StreamEvent.tool_call(block.name, block.input)
+                        yield StreamEvent.status(f"执行工具: {block.name}")
+
+                        # 权限确认
+                        approved = await self._check_permission(block.name, block.input)
+                        if not approved:
+                            yield StreamEvent.error(f"操作被拒绝: {block.name}")
+                            return
+
+            elif isinstance(msg, ResultMessage):
+                self.session_id = msg.session_id
+
+        # 完成事件
+        yield StreamEvent.complete(
+            session_id=self.session_id or "",
+            content="\n".join(response_text)
         )
 
     async def _check_permission(self, tool_name: str, tool_input: dict) -> bool:

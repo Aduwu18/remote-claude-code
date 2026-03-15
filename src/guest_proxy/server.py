@@ -18,6 +18,8 @@ from src.protocol import (
     ResponseStatus,
     ErrorCode,
     RequestMethod,
+    StreamEvent,
+    StreamEventType,
 )
 from src.guest_proxy.claude_client import GuestClaudeClient, chat_sync
 from src.guest_proxy.watchdog import get_watchdog, init_watchdog, WatchdogEvent
@@ -72,6 +74,7 @@ class GuestProxyServer:
         # 创建 aiohttp 应用 (10MB max body size for long messages)
         self._app = web.Application(client_max_size=10 * 1024 * 1024)
         self._app.router.add_post("/rpc", self._handle_rpc)
+        self._app.router.add_post("/stream", self._handle_stream)
         self._app.router.add_get("/health", self._handle_health)
 
         # 启动服务
@@ -158,10 +161,115 @@ class GuestProxyServer:
                 JsonRpcResponse.create_error("", ErrorCode.INTERNAL_ERROR, f"{error_type}: {error_msg}").to_dict()
             )
 
+    async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
+        """
+        处理流式聊天请求
+
+        使用 NDJSON (Newline-Delimited JSON) 格式返回流式响应
+
+        Args:
+            request: HTTP 请求
+
+        Returns:
+            web.StreamResponse: 流式响应
+        """
+        # 创建流式响应
+        response = web.StreamResponse()
+        response.content_type = 'application/x-ndjson'
+        response.headers['Cache-Control'] = 'no-cache'
+        response.headers['Connection'] = 'keep-alive'
+        await response.prepare(request)
+
+        # 用于取消任务的标志
+        cancelled = False
+
+        try:
+            body = await request.json()
+            rpc_request = JsonRpcRequest.from_dict(body)
+            logger.info(f"收到流式请求: {rpc_request.method}")
+
+            chat_params = ChatParams.from_dict(rpc_request.params)
+            chat_id = chat_params.chat_id
+            session_id = chat_params.session_id
+
+            logger.info(f"流式聊天: chat={chat_id[:8]}..., session={session_id[:8] if session_id else 'None'}...")
+
+            # 启动任务监控
+            task_id = f"stream-{chat_id}-{os.urandom(4).hex()}"
+            get_watchdog().start_task(task_id, chat_id)
+
+            # 心跳任务
+            heartbeat_interval = 5  # 5秒心跳
+
+            async def send_heartbeat():
+                """发送心跳"""
+                while not cancelled:
+                    try:
+                        event = StreamEvent.heartbeat()
+                        await response.write(event.to_json().encode() + b'\n')
+                        await response.drain()
+                    except Exception as e:
+                        logger.debug(f"心跳发送失败: {e}")
+                        break
+                    await asyncio.sleep(heartbeat_interval)
+
+            # 获取客户端
+            client = await self._get_or_create_client(chat_id, session_id)
+
+            # 启动心跳任务
+            heartbeat_task = asyncio.create_task(send_heartbeat())
+
+            try:
+                # 流式处理消息
+                async for event in client.chat_stream(chat_params.message):
+                    if cancelled:
+                        break
+
+                    # 写入事件
+                    await response.write(event.to_json().encode() + b'\n')
+                    await response.drain()
+
+                    # 更新任务
+                    get_watchdog().update_task(task_id)
+
+                    # 更新会话缓存
+                    if event.event_type == StreamEventType.COMPLETE:
+                        new_session_id = event.data.get("session_id")
+                        if new_session_id:
+                            self._sessions[chat_id] = (new_session_id, client)
+
+            finally:
+                cancelled = True
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                get_watchdog().end_task(task_id, success=True)
+
+        except json.JSONDecodeError as e:
+            logger.error(f"流式请求 JSON 解析错误: {e}")
+            event = StreamEvent.error("无效的 JSON 格式")
+            await response.write(event.to_json().encode() + b'\n')
+        except Exception as e:
+            import traceback
+            error_type = type(e).__name__
+            error_msg = str(e) if str(e) else "(无详细信息)"
+            tb = traceback.format_exc()
+            logger.error(f"流式处理异常: {error_type}: {error_msg}\n{tb}")
+            try:
+                event = StreamEvent.error(f"{error_type}: {error_msg}")
+                await response.write(event.to_json().encode() + b'\n')
+            except Exception:
+                pass
+
+        return response
+
     def _get_handler(self, method: str):
         """获取请求处理器"""
         handlers = {
             RequestMethod.CHAT.value: self._handle_chat,
+            RequestMethod.CHAT_STREAM.value: self._handle_chat,  # 流式聊天使用相同的处理器
             RequestMethod.HEALTH_CHECK.value: self._handle_health_check,
         }
         return handlers.get(method)

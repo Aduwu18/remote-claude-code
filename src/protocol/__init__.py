@@ -9,13 +9,14 @@ from typing import Optional, Any, Union
 from enum import Enum
 import json
 import uuid
+import time
 
 
 class RequestMethod(str, Enum):
     """请求方法枚举"""
     # 会话管理
-    CHAT = "chat"                       # 发送消息
-    CHAT_STREAM = "chat_stream"         # 流式消息（暂不实现）
+    CHAT = "chat"                       # 发送消息（同步）
+    CHAT_STREAM = "chat_stream"         # 发送消息（流式响应）
 
     # 会话控制
     CREATE_SESSION = "create_session"   # 创建新会话
@@ -44,6 +45,94 @@ class ResponseStatus(str, Enum):
     FAILED = "failed"                   # 任务失败
     TIMEOUT = "timeout"                 # 超时
     PERMISSION_DENIED = "permission_denied"  # 权限被拒绝
+
+
+class StreamEventType(str, Enum):
+    """流式事件类型枚举"""
+    HEARTBEAT = "heartbeat"      # 心跳（保持连接）
+    STATUS = "status"            # 状态更新
+    TOOL_CALL = "tool_call"      # 工具调用
+    CONTENT = "content"          # 内容片段
+    COMPLETE = "complete"        # 完成
+    ERROR = "error"              # 错误
+
+
+@dataclass
+class StreamEvent:
+    """
+    流式事件
+
+    用于 Guest Proxy 向 Host Bridge 发送流式状态更新
+
+    Example:
+        {
+            "event_type": "status",
+            "data": {"text": "正在读取文件..."},
+            "timestamp": 1234567890.123
+        }
+    """
+    event_type: StreamEventType
+    data: dict
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return {
+            "event_type": self.event_type.value,
+            "data": self.data,
+            "timestamp": self.timestamp,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'StreamEvent':
+        return cls(
+            event_type=StreamEventType(data["event_type"]),
+            data=data.get("data", {}),
+            timestamp=data.get("timestamp", time.time()),
+        )
+
+    @classmethod
+    def from_json(cls, json_str: str) -> 'StreamEvent':
+        return cls.from_dict(json.loads(json_str))
+
+    # 便捷工厂方法
+    @classmethod
+    def heartbeat(cls) -> 'StreamEvent':
+        """创建心跳事件"""
+        return cls(event_type=StreamEventType.HEARTBEAT, data={})
+
+    @classmethod
+    def status(cls, text: str, details: str = None) -> 'StreamEvent':
+        """创建状态更新事件"""
+        data = {"text": text}
+        if details:
+            data["details"] = details
+        return cls(event_type=StreamEventType.STATUS, data=data)
+
+    @classmethod
+    def tool_call(cls, name: str, input: dict) -> 'StreamEvent':
+        """创建工具调用事件"""
+        return cls(event_type=StreamEventType.TOOL_CALL, data={"name": name, "input": input})
+
+    @classmethod
+    def content(cls, text: str) -> 'StreamEvent':
+        """创建内容片段事件"""
+        return cls(event_type=StreamEventType.CONTENT, data={"text": text})
+
+    @classmethod
+    def complete(cls, session_id: str, content: str = "") -> 'StreamEvent':
+        """创建完成事件"""
+        return cls(event_type=StreamEventType.COMPLETE, data={"session_id": session_id, "content": content})
+
+    @classmethod
+    def error(cls, message: str, error_type: str = None) -> 'StreamEvent':
+        """创建错误事件"""
+        data = {"message": message}
+        if error_type:
+            data["error_type"] = error_type
+        return cls(event_type=StreamEventType.ERROR, data=data)
 
 
 @dataclass

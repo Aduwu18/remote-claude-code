@@ -283,14 +283,15 @@ async def handle_status_update(params):
 
 def chat_with_guest_proxy(chat_id: str, message: str, user_open_id: str = None) -> str:
     """
-    转发消息到 Guest Proxy
+    转发消息到 Guest Proxy（使用流式响应）
 
     流程：
     1. 查找 Redis 路由
-    2. 转发到 Guest Proxy
-    3. 返回结果
+    2. 使用流式客户端转发到 Guest Proxy
+    3. 实时更新状态卡片
+    4. 返回结果
     """
-    status_mgr = StatusManager(chat_id)
+    status_mgr = StatusManager(chat_id, min_update_interval=5.0)  # 5秒更新间隔
     status_mgr.send_status("⏳ 正在处理您的请求...")
 
     try:
@@ -322,11 +323,19 @@ def chat_with_guest_proxy(chat_id: str, message: str, user_open_id: str = None) 
         try:
             async def _send():
                 async with GuestProxyClient() as client:
-                    result = await client.chat(
+                    # 状态更新回调
+                    async def on_status_update(status: str, details: str = None):
+                        status_text = status
+                        if details:
+                            status_text = f"{status}: {details}"
+                        status_mgr.update_status(status_text)
+
+                    result = await client.chat_stream(
                         endpoint=endpoint,
                         message=message,
                         chat_id=chat_id,
                         user_open_id=user_open_id,
+                        status_callback=on_status_update,
                     )
                     return result
 

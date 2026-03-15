@@ -99,14 +99,48 @@ Feishu Message → WebSocket → interceptor.try_intercept()
                                   ↓ (not intercepted)
                            Redis lookup: get_route(chat_id)
                                   ↓
-                           GuestProxyClient.chat() → HTTP POST to Guest Proxy
+                           GuestProxyClient.chat_stream() → HTTP Stream to Guest Proxy
                                   ↓
-                           GuestClaudeClient.chat() → Claude SDK
+                           GuestClaudeClient.chat_stream() → Claude SDK
                                   ↓
-                           Permission request (if sensitive tool)
+                           Stream events (status, tool_call, content, complete)
                                   ↓
-                           Response → Feishu message
+                           Real-time status updates via StatusManager
+                                  ↓
+                           Final response → Feishu message
 ```
+
+### Streaming Response Architecture
+
+The system uses **streaming responses** for real-time feedback during long-running tasks:
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  WebSocket   │───►│ Redis Router │───►│ Guest Proxy  │
+│  (飞书消息)   │    │  (路由索引)   │    │ (容器内服务)  │
+└──────────────┘    └──────────────┘    └──────────────┘
+       │                                       │
+       │         ┌──────────────┐             │
+       └────────►│ Status Card  │◄────────────┘
+                 │ (实时更新)    │
+                 └──────────────┘
+```
+
+**Key Components:**
+- **NDJSON Stream**: Guest Proxy sends newline-delimited JSON events
+- **Heartbeat**: 5-second heartbeats keep HTTP connection alive
+- **Status Updates**: Real-time updates to Feishu status cards (5s interval)
+- **30-minute timeout**: Total streaming timeout of 30 minutes
+
+**Stream Event Types:**
+| Event | Description |
+|-------|-------------|
+| `heartbeat` | Keep-alive signal |
+| `status` | Status text update |
+| `tool_call` | Tool being executed |
+| `content` | Response content chunk |
+| `complete` | Task finished |
+| `error` | Error occurred |
 
 ### Host-Guest Architecture
 
@@ -187,7 +221,7 @@ All Host-Guest communication uses JSON-RPC 2.0:
 }
 ```
 
-**Key methods:** `chat`, `register`, `permission`, `status_update`, `heartbeat`
+**Key methods:** `chat`, `chat_stream`, `register`, `permission`, `status_update`, `heartbeat`
 
 ### 2. Protocol Interceptor (`src/interceptor.py`)
 
@@ -211,6 +245,17 @@ else:
 HTTP client for communicating with Guest Proxy:
 
 ```python
+# Streaming (recommended for long tasks)
+async with GuestProxyClient() as client:
+    result = await client.chat_stream(
+        endpoint="http://container:8081",
+        message="...",
+        chat_id="...",
+        user_open_id="...",
+        status_callback=lambda status, details: print(status),
+    )
+
+# Synchronous (for simple queries)
 async with GuestProxyClient() as client:
     result = await client.chat(
         endpoint="http://container:8081",
@@ -231,6 +276,17 @@ client = GuestClaudeClient(
     host_bridge_url="http://host:8080",
 )
 await client.connect()
+
+# Streaming (yields real-time events)
+async for event in client.chat_stream("message"):
+    if event.event_type == StreamEventType.STATUS:
+        print(f"Status: {event.data['text']}")
+    elif event.event_type == StreamEventType.CONTENT:
+        print(event.data['text'])
+    elif event.event_type == StreamEventType.COMPLETE:
+        print(f"Done: {event.data['session_id']}")
+
+# Synchronous
 response = await client.chat("message")
 # response.content, response.session_id, response.tool_calls
 ```
