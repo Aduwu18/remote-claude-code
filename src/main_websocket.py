@@ -55,7 +55,7 @@ from src.config import (
 from src.redis_client import init_redis, redis_client
 from src.host_bridge import start_host_bridge, GuestProxyClient
 from src.host_bridge.server import HostBridgeServer
-from src.feishu_utils.feishu_utils import send_message, create_group_chat, send_card_message
+from src.feishu_utils.feishu_utils import send_message, create_group_chat, send_card_message, send_markdown_message
 from src.permission_manager import format_permission_message, build_permission_card_json
 from src.docker_session_manager import docker_session_manager
 from src.status_manager import StatusManager
@@ -178,13 +178,13 @@ async def create_docker_session_handler(
 - 直接发送消息即可与 Claude 对话
 - 发送 /exit 或「退出」结束会话"""
 
-        send_message(docker_chat_id, welcome_msg)
+        send_markdown_message(docker_chat_id, welcome_msg)
 
         # 5. 通知原会话
-        send_message(
+        send_markdown_message(
             original_chat_id,
             f"✅ 已创建容器会话\n"
-            f"容器: {container_name}\n"
+            f"容器: **{container_name}**\n"
             f"请在新的群聊窗口中继续操作。"
         )
 
@@ -244,7 +244,7 @@ async def handle_permission_request_from_guest(params: PermissionParams) -> bool
         # 降级为文本消息
         logger.warning(f"发送权限卡片失败，降级为文本: {res}")
         message = format_permission_message(tool_name, tool_input)
-        send_message(chat_id, message)
+        send_markdown_message(chat_id, message)
 
     # 标记等待权限确认
     with _pending_permission_lock:
@@ -260,7 +260,7 @@ async def handle_permission_request_from_guest(params: PermissionParams) -> bool
         approved = await asyncio.wait_for(future, timeout=300)  # 5 分钟超时
         return approved
     except asyncio.TimeoutError:
-        send_message(chat_id, "⏰ 权限确认超时")
+        send_markdown_message(chat_id, "⏰ 权限确认超时")
         return False
     finally:
         with _pending_permission_lock:
@@ -274,11 +274,11 @@ async def handle_status_update(params):
     status = params.status
     details = params.details
 
-    # 发送状态消息到飞书
-    status_msg = f"📋 {status}"
+    # 发送状态消息到飞书（使用 Markdown 卡片）
+    status_msg = f"📋 **{status}**"
     if details:
         status_msg += f": {details}"
-    send_message(chat_id, status_msg)
+    send_markdown_message(chat_id, status_msg)
 
 
 def chat_with_guest_proxy(chat_id: str, message: str, user_open_id: str = None) -> str:
@@ -407,12 +407,12 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             authorized_users = docker_session_manager.get_authorized_users(chat_id)
             if sender_id not in authorized_users:
                 logger.warning(f"容器会话未授权用户: {sender_id}")
-                send_message(chat_id, "您没有使用此容器会话的权限。")
+                send_markdown_message(chat_id, "⚠️ 您没有使用此容器会话的权限。")
                 return
         else:
             if not is_authorized(sender_id):
                 logger.warning(f"未授权用户: {sender_id}")
-                send_message(chat_id, "您没有使用此机器人的权限。")
+                send_markdown_message(chat_id, "⚠️ 您没有使用此机器人的权限。")
                 return
 
         lower_text = text.lower().strip()
@@ -438,9 +438,9 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             original_chat_id = docker_session_manager.get_original_chat_id(chat_id)
             docker_session_manager.delete_docker_session(chat_id)
             redis_client.delete_route(chat_id)
-            send_message(chat_id, "👋 已退出容器会话。")
+            send_markdown_message(chat_id, "👋 已退出容器会话。")
             if original_chat_id:
-                send_message(original_chat_id, "容器会话已结束。")
+                send_markdown_message(original_chat_id, "容器会话已结束。")
             return
 
         # 检查权限确认响应
@@ -450,11 +450,11 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         if future and not future.done():
             if lower_text in ["y", "yes", "确认", "允许"]:
                 future.set_result(True)
-                send_message(chat_id, "✅ 已允许操作")
+                send_markdown_message(chat_id, "✅ 已允许操作")
                 return
             elif lower_text in ["n", "no", "拒绝", "取消"]:
                 future.set_result(False)
-                send_message(chat_id, "❌ 已拒绝操作")
+                send_markdown_message(chat_id, "❌ 已拒绝操作")
                 return
 
         # 尝试拦截管理命令
@@ -474,10 +474,10 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                             result = loop.run_until_complete(
                                 create_docker_session_handler(user_id, container_name, orig_chat_id)
                             )
-                            send_message(chat_id, result)
+                            send_markdown_message(chat_id, result)
                         except Exception as e:
                             logger.error(f"创建会话失败: {e}")
-                            send_message(chat_id, f"❌ 创建会话失败: {e}")
+                            send_markdown_message(chat_id, f"❌ 创建会话失败: {e}")
                         finally:
                             loop.close()
                     threading.Thread(target=_create_session, daemon=True).start()
@@ -493,18 +493,18 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                                 delete_docker_session_handler(session_chat_id)
                             )
                             if success:
-                                send_message(chat_id, "👋 已退出容器会话")
+                                send_markdown_message(chat_id, "👋 已退出容器会话")
                             else:
-                                send_message(chat_id, "⚠️ 当前不在容器会话中")
+                                send_markdown_message(chat_id, "⚠️ 当前不在容器会话中")
                         except Exception as e:
                             logger.error(f"退出会话失败: {e}")
-                            send_message(chat_id, f"❌ 退出会话失败: {e}")
+                            send_markdown_message(chat_id, f"❌ 退出会话失败: {e}")
                         finally:
                             loop.close()
                     threading.Thread(target=_delete_session, daemon=True).start()
                     return
             else:
-                send_message(chat_id, intercepted)
+                send_markdown_message(chat_id, intercepted)
             return
 
         # 加入队列处理

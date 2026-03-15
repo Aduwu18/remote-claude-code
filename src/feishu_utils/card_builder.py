@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 @dataclass
 class CardElement:
     """卡片元素基类"""
-    tag: str
+    tag: str = field(default="", init=False)
 
     def to_dict(self) -> dict:
         return {"tag": self.tag}
@@ -35,8 +35,10 @@ class CardElement:
 class DivElement(CardElement):
     """文本块元素"""
     text: str
-    tag: str = "div"
     text_type: str = "lark_md"  # lark_md 或 plain_text
+
+    def __post_init__(self):
+        self.tag = "div"
 
     def to_dict(self) -> dict:
         return {
@@ -52,7 +54,9 @@ class DivElement(CardElement):
 class ActionElement(CardElement):
     """操作区域元素（按钮等）"""
     actions: List[Dict[str, Any]]
-    tag: str = "action"
+
+    def __post_init__(self):
+        self.tag = "action"
 
     def to_dict(self) -> dict:
         return {
@@ -64,14 +68,18 @@ class ActionElement(CardElement):
 @dataclass
 class DividerElement(CardElement):
     """分割线元素"""
-    tag: str = "hr"
+
+    def __post_init__(self):
+        self.tag = "hr"
 
 
 @dataclass
 class NoteElement(CardElement):
     """备注元素（灰色小字）"""
     text: str
-    tag: str = "note"
+
+    def __post_init__(self):
+        self.tag = "note"
 
     def to_dict(self) -> dict:
         return {

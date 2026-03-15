@@ -39,12 +39,12 @@ def reply_message(message_id, text, access_token=None):
 def send_message(receive_id, text, access_token=None):
     if access_token is None:
         access_token = get_tenant_access_token()
-        
+
     url = 'https://open.feishu.cn/open-apis/im/v1/messages'
     param = {'receive_id_type': 'chat_id'}
-    
+
     ret_data = {'text':text}
-    
+
     body = {
         'receive_id': receive_id,
         "msg_type": "text",
@@ -53,6 +53,40 @@ def send_message(receive_id, text, access_token=None):
     }
     res = requests.post(url, headers=get_headers(access_token), json=body, params=param).json()
     return res
+
+
+def send_markdown_message(receive_id: str, text: str, title: str = "", access_token=None) -> dict:
+    """
+    发送 Markdown 格式消息（使用卡片渲染）
+
+    支持的 Markdown 语法：
+    - 标题、粗体、斜体
+    - 链接 [text](url)
+    - 代码块、行内代码
+    - 有序/无序列表
+    - 表格
+    - 引用块
+
+    Args:
+        receive_id: 接收者 ID (chat_id)
+        text: Markdown 内容
+        title: 可选的卡片标题
+        access_token: 访问令牌（可选）
+
+    Returns:
+        dict: API 响应
+    """
+    from src.feishu_utils.card_builder import CardBuilder
+
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    builder = CardBuilder()
+    if title:
+        builder.set_header(title, "blue")
+    builder.add_div(text, "lark_md")
+
+    return send_card_message(receive_id, builder.build(), access_token)
 
 def get_department_member_list(department_id, access_token=None):
     if access_token is None:
