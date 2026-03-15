@@ -3,8 +3,10 @@ Guest Proxy 客户端
 
 用于从 Host Bridge 向 Guest Proxy 发送请求
 """
+import asyncio
 import aiohttp
 import logging
+import traceback
 from typing import Optional
 
 from src.protocol import (
@@ -136,17 +138,35 @@ class GuestProxyClient:
                     tool_calls=result.get("tool_calls", []),
                 )
 
-        except aiohttp.ClientError as e:
-            logger.error(f"Guest Proxy 连接失败: {e}")
+        except asyncio.CancelledError:
+            logger.error("Guest Proxy 请求被取消")
             return ChatResult(
-                content=f"连接失败: {e}",
+                content="请求被取消，可能是处理超时",
+                status="failed",
+                session_id="",
+            )
+        except aiohttp.ClientError as e:
+            logger.error(f"Guest Proxy 连接失败: {type(e).__name__}: {e}")
+            return ChatResult(
+                content=f"连接失败: {type(e).__name__}: {e}",
+                status="failed",
+                session_id="",
+            )
+        except TimeoutError as e:
+            logger.error(f"Guest Proxy 请求超时: {e}")
+            return ChatResult(
+                content="请求超时，请稍后重试",
                 status="failed",
                 session_id="",
             )
         except Exception as e:
-            logger.error(f"Guest Proxy 请求异常: {e}")
+            import traceback
+            error_type = type(e).__name__
+            error_msg = str(e) if str(e) else "(无详细信息)"
+            tb = traceback.format_exc()
+            logger.error(f"Guest Proxy 请求异常: {error_type}: {error_msg}\n{tb}")
             return ChatResult(
-                content=f"请求异常: {e}",
+                content=f"请求异常 [{error_type}]: {error_msg}",
                 status="failed",
                 session_id="",
             )

@@ -149,9 +149,13 @@ class GuestProxyServer:
                 JsonRpcResponse.create_error("", ErrorCode.PARSE_ERROR, "Parse error").to_dict()
             )
         except Exception as e:
-            logger.error(f"RPC 处理异常: {e}")
+            import traceback
+            error_type = type(e).__name__
+            error_msg = str(e) if str(e) else "(无详细信息)"
+            tb = traceback.format_exc()
+            logger.error(f"RPC 处理异常: {error_type}: {error_msg}\n{tb}")
             return web.json_response(
-                JsonRpcResponse.create_error("", ErrorCode.INTERNAL_ERROR, str(e)).to_dict()
+                JsonRpcResponse.create_error("", ErrorCode.INTERNAL_ERROR, f"{error_type}: {error_msg}").to_dict()
             )
 
     def _get_handler(self, method: str):
@@ -207,9 +211,13 @@ class GuestProxyServer:
                 get_watchdog().end_task(task_id, success=True)
 
         except Exception as e:
-            logger.error(f"聊天处理异常: {e}")
+            import traceback
+            error_type = type(e).__name__
+            error_msg = str(e) if str(e) else "(无详细信息)"
+            tb = traceback.format_exc()
+            logger.error(f"聊天处理异常: {error_type}: {error_msg}\n{tb}")
             return {
-                "content": f"处理请求失败: {e}",
+                "content": f"处理请求失败 [{error_type}]: {error_msg}",
                 "status": ResponseStatus.FAILED.value,
                 "session_id": "",
                 "tool_calls": [],
