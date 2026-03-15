@@ -75,7 +75,13 @@ class HostBridgeServer:
         # 启动服务
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
-        self._site = web.TCPSite(self._runner, "0.0.0.0", self.port)
+        self._site = web.TCPSite(
+            self._runner,
+            "0.0.0.0",
+            self.port,
+            reuse_address=True,  # 允许快速重用端口
+            reuse_port=True,     # 允许多进程绑定同一端口
+        )
         await self._site.start()
 
         logger.info(f"Host Bridge 已启动，端口: {self.port}")

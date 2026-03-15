@@ -29,6 +29,8 @@ import asyncio
 import json
 import logging
 import threading
+import signal
+import atexit
 from queue import Queue
 from typing import Optional
 
@@ -78,6 +80,32 @@ _pending_docker_lock = threading.Lock()
 
 # 全局 Host Bridge 服务
 _host_bridge: Optional[HostBridgeServer] = None
+
+# 全局 shutdown 事件
+_shutdown_event = asyncio.Event()
+
+
+def _signal_handler():
+    """信号处理器"""
+    logger.info("收到终止信号，正在关闭...")
+    _shutdown_event.set()
+
+
+def _cleanup_on_exit():
+    """进程退出时的清理函数（atexit 备份机制）"""
+    global _host_bridge
+    if _host_bridge:
+        try:
+            # 同步版本的清理
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_host_bridge.stop())
+            finally:
+                loop.close()
+            logger.info("atexit 清理完成")
+        except Exception as e:
+            logger.error(f"atexit 清理失败: {e}")
 
 
 async def create_docker_session_handler(
@@ -482,6 +510,14 @@ async def async_main():
     """异步主函数"""
     global _host_bridge
 
+    # 注册 atexit 清理（备份机制）
+    atexit.register(_cleanup_on_exit)
+
+    # 注册信号处理器
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _signal_handler)
+
     # 1. 初始化 Redis
     if not init_redis():
         logger.error("Redis 连接失败，服务无法启动")
@@ -521,15 +557,14 @@ async def async_main():
     ws_thread = threading.Thread(target=client.start, daemon=True)
     ws_thread.start()
 
-    # 主线程保持运行
+    # 主线程保持运行，等待 shutdown 信号
     try:
-        while True:
-            await asyncio.sleep(3600)
-    except KeyboardInterrupt:
-        logger.info("收到中断信号")
+        await _shutdown_event.wait()
     finally:
+        logger.info("正在停止服务...")
         await _host_bridge.stop()
         redis_client.close()
+        logger.info("服务已停止")
 
 
 def main():
