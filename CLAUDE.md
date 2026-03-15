@@ -4,21 +4,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A Feishu (飞书) bot that integrates Claude Code CLI, enabling users to interact with Claude Code through Feishu chat. The bot supports multiple users with independent conversation contexts and can execute local computer operations.
+A Feishu (飞书) bot that integrates Claude Code CLI, enabling users to interact with Claude Code through Feishu chat. Uses a **Host-Guest architecture** for deep environment isolation.
+
+**Architecture:**
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  WebSocket   │───►│ Redis Router │───►│ Guest Proxy  │
+│  (飞书消息)   │    │  (路由索引)   │    │ (容器内服务)  │
+└──────────────┘    └──────────────┘    └──────────────┘
+```
 
 **Core Features:**
-- Multi-user support with independent conversation contexts per chat (private/group)
-- Session persistence via SQLite for conversation continuity across restarts
-- User authorization via `config.yaml` whitelist
-- Permission confirmation flow for sensitive operations (Write, Edit, Bash)
-- WebSocket long connection (no public domain required)
-- Docker container sessions with isolated contexts per container
+- Guest Proxy runs inside Docker containers, inheriting `.bashrc`, venv, and environment
+- Redis stores `chat_id -> container_endpoint` routing
+- Permission confirmation via Feishu messages for sensitive operations (Write, Edit, Bash)
+- Protocol interceptor for management commands (`/ls`, `/start`, `/exit`)
+- Independent Claude sessions per container
 
 ## Quick Start
 
 ```bash
 # Install dependencies
 pip install -r requirements.txt
+
+# Start Redis (required)
+docker run -d -p 6379:6379 --name redis redis:7-alpine
 
 # Configure environment
 cp .env.example .env
@@ -43,6 +53,7 @@ tail -f log.log
 |----------|----------|-------------|
 | `APP_ID` | Yes | Feishu application ID |
 | `APP_SECRET` | Yes | Feishu application secret |
+| `ANTHROPIC_API_KEY` | Yes | Claude API key (for Guest Proxy) |
 
 ## Configuration (`config.yaml`)
 
@@ -66,74 +77,78 @@ permission:
 
 | Module | Purpose |
 |--------|---------|
-| `src/main_websocket.py` | Main entry point - WebSocket long connection handler |
-| `src/main.py` | Alternative HTTP webhook handler (requires public domain) |
-| `src/claude_code/conversation.py` | Claude Code SDK wrapper with session management |
-| `src/docker_mcp.py` | Docker MCP Server with `create_docker_session` tool |
-| `src/context.py` | Request context management using `contextvars` |
-| `src/docker_session_manager.py` | Docker container session persistence |
+| `src/main_websocket.py` | Main entry - WebSocket handler + Host Bridge initialization |
+| `src/host_bridge/server.py` | HTTP server for Guest Proxy registration and permission forwarding |
+| `src/host_bridge/client.py` | HTTP client for communicating with Guest Proxy |
+| `src/guest_proxy/server.py` | HTTP server running inside Docker containers |
+| `src/guest_proxy/claude_client.py` | Claude Code SDK wrapper with permission callbacks |
+| `src/protocol/__init__.py` | JSON-RPC 2.0 protocol definitions (requests, responses, error codes) |
+| `src/interceptor.py` | Protocol interceptor for management commands (`/ls`, `/start`, `/exit`) |
+| `src/redis_client.py` | Redis client for route management (`chat_id -> endpoint`) |
+| `src/docker_session_manager.py` | Docker session persistence (SQLite) |
 | `src/permission_manager.py` | Permission confirmation state management |
 | `src/config.py` | Configuration loading (YAML + env vars) and user authorization |
-| `src/feishu_utils/feishu_utils.py` | Feishu API utilities (send/reply messages) |
-| `src/data_base_utils/session_store.py` | SQLite session persistence |
+| `src/feishu_utils/feishu_utils.py` | Feishu API utilities (send/reply messages, create group chats) |
 
-### Data Flow
+### Request Flow
 
 ```
-Feishu Message → WebSocket → handle_message() → enqueue_message()
-                                                        ↓
-                                               chat_with_claude()
-                                                        ↓
-                                         session_store.get_session()
-                                                        ↓
-                                         claude_code.chat_sync()
-                                                        ↓
-                                         session_store.save_session()
-                                                        ↓
-                                         feishu_utils.reply/send_message()
+Feishu Message → WebSocket → interceptor.try_intercept()
+                                  ↓ (not intercepted)
+                           Redis lookup: get_route(chat_id)
+                                  ↓
+                           GuestProxyClient.chat() → HTTP POST to Guest Proxy
+                                  ↓
+                           GuestClaudeClient.chat() → Claude SDK
+                                  ↓
+                           Permission request (if sensitive tool)
+                                  ↓
+                           Response → Feishu message
 ```
+
+### Host-Guest Architecture
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        Host Bridge (宿主机)                              │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐      │
+│  │ WebSocket    │    │ Redis        │    │ HTTP Server          │      │
+│  │ (飞书长连接)  │    │ (路由索引)    │    │ :8080 (RPC + 注册)   │      │
+│  └──────────────┘    └──────────────┘    └──────────────────────┘      │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │ HTTP
+          ┌───────────────────┼───────────────────┐
+          ▼                   ▼                   ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│ Guest Proxy #1  │  │ Guest Proxy #2  │  │ Guest Proxy #N  │
+│ (容器 A 内)      │  │ (容器 B 内)      │  │ (容器 N 内)      │
+│                 │  │                 │  │                 │
+│ 继承容器环境:    │  │ 继承容器环境:    │  │ 继承容器环境:    │
+│ • .bashrc      │  │ • .bashrc      │  │ • .bashrc      │
+│ • venv         │  │ • venv         │  │ • venv         │
+│ • env vars     │  │ • env vars     │  │ • env vars     │
+└─────────────────┘  └─────────────────┘  └─────────────────┘
+```
+
+**Key Points:**
+- Guest Proxy runs inside Docker containers, inherits all environment settings
+- Each container has independent Claude sessions
+- Host Bridge is stateless - all routing stored in Redis
 
 ### Session Model
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  Feishu Chat ID          Claude Code Session        │
+│  Feishu Chat ID          Guest Proxy Endpoint       │
 ├─────────────────────────────────────────────────────┤
-│  User A (private)  ────►  session_abc (isolated)    │
-│  User B (private)  ────►  session_xyz (isolated)    │
-│  Project Group     ────►  session_123 (shared)      │
-│  Test Group        ────►  session_456 (shared)      │
-│  Docker Container  ────►  session_789 (container)   │
+│  User A (private)  ────►  container_a:8081         │
+│  User B (private)  ────►  container_b:8081         │
+│  Project Group     ────►  container_c:8081         │
+│  Docker Session    ────►  specific container        │
 └─────────────────────────────────────────────────────┘
 ```
 
-Each `chat_id` (private or group) maps to an independent Claude Code session stored in SQLite.
-
-### Docker Container Session Model
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                    Docker Container Session Flow                      │
-├──────────────────────────────────────────────────────────────────────┤
-│  User: "进入 xxx 容器"                                                │
-│       ↓                                                               │
-│  Claude calls create_docker_session MCP tool                         │
-│       ↓                                                               │
-│  Tool reads context via environment variables                         │
-│       ↓                                                               │
-│  Send confirmation request to Feishu                                 │
-│       ↓                                                               │
-│  User confirms (y/n)                                                 │
-│       ↓                                                               │
-│  Create group chat "🐳 {container} (Claude助手)"                     │
-│       ↓                                                               │
-│  Save mapping: docker_chat_id → container_name                       │
-│       ↓                                                               │
-│  User operates container in new group chat window                    │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-Docker sessions create a dedicated group chat (not P2P) with a descriptive name, allowing Claude to execute commands in the specified container.
+Redis stores `chat_id -> endpoint` mapping. Docker sessions create dedicated group chats named "🐳 {container_name}".
 
 ### Permission Model
 
@@ -149,170 +164,187 @@ Docker sessions create a dedicated group chat (not P2P) with a descriptive name,
 
 ## Key Patterns
 
-### 1. Claude Code Integration (`conversation.py`)
+### 1. JSON-RPC Protocol (`src/protocol/__init__.py`)
+
+All Host-Guest communication uses JSON-RPC 2.0:
 
 ```python
-# Async context manager for session lifecycle
-async with ConversationClient(session_id="xxx") as client:
-    response = await client.chat("message")
-    session_id = client.session_id  # New or existing session
+# Request
+{
+    "jsonrpc": "2.0",
+    "method": "chat",
+    "params": {"message": "...", "chat_id": "...", "user_open_id": "..."},
+    "id": "req-123"
+}
 
-# Synchronous wrapper for non-async contexts
-reply, session_id = chat_sync("message", session_id="xxx")
+# Response
+{
+    "jsonrpc": "2.0",
+    "result": {"content": "...", "status": "completed", "session_id": "..."},
+    "id": "req-123"
+}
 ```
 
-**Important**: `chat_sync()` uses `ThreadPoolExecutor` with a new event loop to avoid conflicts with existing async contexts.
+**Key methods:** `chat`, `register`, `permission`, `status_update`, `heartbeat`
 
-### 2. MCP Server for Docker Sessions (`docker_mcp.py`)
+### 2. Protocol Interceptor (`src/interceptor.py`)
 
-Docker container sessions use SDK's standard MCP tool mechanism:
+Management commands are intercepted before routing:
 
 ```python
-@tool(
-    name="create_docker_session",
-    description="创建 Docker 容器专属会话...",
-    input_schema={"container_name": str}
+interceptor = get_interceptor()
+result = interceptor.try_intercept(user_id, chat_id, message)
+if result:
+    # Command was handled (e.g., /ls, /start, /exit)
+    send_message(chat_id, result)
+else:
+    # Route to Guest Proxy via Redis
+    endpoint = redis_client.get_route(chat_id)
+```
+
+**Supported commands:** `/ls`, `/start <name>`, `/enter <name>`, `/stop`, `/exit`, `/help`
+
+### 3. Guest Proxy Client (`src/host_bridge/client.py`)
+
+HTTP client for communicating with Guest Proxy:
+
+```python
+async with GuestProxyClient() as client:
+    result = await client.chat(
+        endpoint="http://container:8081",
+        message="...",
+        chat_id="...",
+        user_open_id="...",
+    )
+```
+
+### 4. Claude Client (`src/guest_proxy/claude_client.py`)
+
+Claude SDK wrapper with permission callbacks:
+
+```python
+client = GuestClaudeClient(
+    session_id="...",  # Resume session
+    container_name="nginx",
+    host_bridge_url="http://host:8080",
 )
-async def create_docker_session_tool(args: dict) -> dict:
-    # Read context via contextvars
-    chat_id = get_current_chat_id()
-    user_open_id = get_current_user_open_id()
-    # ... handle session creation
+await client.connect()
+response = await client.chat("message")
+# response.content, response.session_id, response.tool_calls
 ```
 
-**Why MCP Tools instead of Prompt Engineering:**
-- **Reliable**: SDK-native tool calling, not regex parsing
-- **Type-safe**: Schema validation on inputs
-- **Result feedback**: Claude sees tool execution results
-- **Standard**: Follows MCP protocol specification
+**Permission flow:** Sensitive tools (Write, Edit, Bash) trigger HTTP request to Host Bridge → Feishu confirmation.
 
-### 3. Request Context (`context.py`)
+### 5. Permission Confirmation Flow
 
-Context is passed to MCP tools using environment variables (cross-process compatible):
+```
+Guest Proxy detects sensitive tool
+       ↓
+HTTP POST to Host Bridge /rpc (method: permission)
+       ↓
+Host Bridge sends message to Feishu
+       ↓
+User replies "y"/"n"
+       ↓
+Host Bridge resolves Future
+       ↓
+Guest Proxy receives approved/denied
+```
+
+### 6. Redis Route Management
 
 ```python
-# Set context before calling Claude
-set_request_context(chat_id, user_open_id)
-try:
-    reply = chat_sync(message, ...)
-finally:
-    clear_request_context()
+# Set route (when container session created)
+redis_client.set_route(chat_id, "http://container:8081")
 
-# MCP tool reads context from environment variables
-import os
-chat_id = os.environ.get("MCP_CHAT_ID")
-user_open_id = os.environ.get("MCP_USER_OPEN_ID")
+# Get route (when message received)
+endpoint = redis_client.get_route(chat_id)
+
+# Delete route (when session ends)
+redis_client.delete_route(chat_id)
 ```
 
-**Why environment variables:** MCP Server runs in a separate process, so `contextvars` cannot cross process boundaries. Environment variables provide a simple cross-process communication mechanism.
-
-### 4. Permission Confirmation Flow
-
-```
-Claude calls tool → _check_permission() → handle_permission_request()
-                                                    ↓
-                                    send_message() to Feishu
-                                                    ↓
-                                    permission_manager.request_permission() (blocks)
-                                                    ↓
-                            User replies "y"/"n" → submit_response() → unblocks
-```
-
-- `PermissionManager` manages pending requests and responses
-- Permission callback is set via `set_permission_request_callback()` at startup
-- User confirmation keywords: "y", "yes", "确认", "允许" (approve) / "n", "no", "拒绝", "取消" (deny)
-
-### 5. Session Persistence
-
-- `get_session(chat_id)` → returns `session_id` or `None`
-- `save_session(chat_id, session_id)` → upsert mapping
-
-Database location: `data/sessions.db`
-
-### 6. Feishu Message Handling
+### 7. Feishu Message Handling
 
 - Group chat: Use `reply_message(message_id, text)` to reply to specific message
 - Private chat: Use `send_message(chat_id, text)` for direct message
-
-### 7. WebSocket vs Webhook
-
-| Mode | File | Requirements |
-|------|------|--------------|
-| WebSocket | `main_websocket.py` | No public domain (recommended) |
-| Webhook | `main.py` | Public domain + ENCRYPT_KEY |
+- Create group: `create_group_chat(user_open_id, group_name)`
 
 ## Claude Code Configuration
 
-The `ConversationClient` configures Claude Code with:
+The `GuestClaudeClient` configures Claude Code with:
 
-- **Permission Mode**: `acceptEdits` (auto-accept file edits)
 - **Allowed Tools**: `["Read", "Write", "Edit", "Bash", "Glob", "Grep"]`
-- **System Prompt**: Local computer assistant with full system access
+- **Permission Mode**: `default` (SDK handles permission prompts)
+- **System Prompt**: Container-aware prompt with environment info
 
-See `SYSTEM_PROMPT` in `conversation.py` for full prompt text.
+See `GUEST_SYSTEM_PROMPT` in `guest_proxy/claude_client.py` for full prompt text.
 
 ## Extension Points
 
-### Replacing the Agent Backend
+### Adding New RPC Methods
 
-Implement a `chat_sync(message, session_id)` function:
+1. Define method in `src/protocol/__init__.py` (`RequestMethod` enum)
+2. Add params/result dataclasses
+3. Add handler in `GuestProxyServer._get_handler()` or `HostBridgeServer._get_handler()`
 
-```python
-def chat_sync(message: str, session_id: str = None) -> tuple[str, str]:
-    """
-    Args:
-        message: User message
-        session_id: Session ID for context continuity
+### Adding New Management Commands
 
-    Returns:
-        (reply_content, new_session_id)
-    """
-    # Your implementation
-    return reply, session_id
-```
+1. Add handler method in `src/interceptor.py`
+2. Register in `self.handlers` dict
 
-Then update the import in `main_websocket.py`:
+### Deploying to New Containers
 
-```python
-# Replace
-from src.claude_code import chat_sync
-
-# With
-from src.your_agent import chat_sync
-```
+See `docs/GUEST_PROXY_INTEGRATION.md` for:
+- Docker Compose volume mounts
+- Environment variables
+- Network configuration
+- Health checks
 
 ## Testing
 
 ```bash
-# Test Claude Code integration
+# Test Claude Code integration (requires ANTHROPIC_API_KEY)
 python test/call_claude_code.py
+
+# Test Docker session creation
+python test/test_docker_session.py
 ```
 
 ## Project Structure
 
 ```
 ├── src/
-│   ├── main_websocket.py      # Main entry (WebSocket)
-│   ├── main.py                # Alternative (HTTP webhook)
+│   ├── main_websocket.py      # Main entry (Host Bridge + WebSocket)
 │   ├── config.py              # Configuration & user authorization
-│   ├── context.py             # Request context management (contextvars)
-│   ├── docker_mcp.py          # Docker MCP Server & tools
+│   ├── redis_client.py        # Redis route management
+│   ├── interceptor.py         # Protocol interceptor for /commands
 │   ├── docker_session_manager.py  # Docker session persistence
 │   ├── permission_manager.py  # Permission confirmation state
-│   ├── claude_code/
+│   ├── status_manager.py      # Status message management
+│   ├── protocol/              # JSON-RPC protocol definitions
+│   │   └── __init__.py
+│   ├── host_bridge/           # Host Bridge (runs on host)
 │   │   ├── __init__.py
-│   │   └── conversation.py    # Claude Code client
-│   ├── feishu_utils/
+│   │   ├── server.py          # HTTP server
+│   │   └── client.py          # Guest Proxy client
+│   ├── guest_proxy/           # Guest Proxy (runs in containers)
 │   │   ├── __init__.py
-│   │   └── feishu_utils.py    # Feishu API helpers
-│   └── data_base_utils/
+│   │   ├── server.py          # HTTP server
+│   │   ├── claude_client.py   # Claude SDK wrapper
+│   │   ├── watchdog.py        # Task monitoring
+│   │   ├── status_handler.py  # Status handling
+│   │   └── config.py          # Configuration
+│   └── feishu_utils/          # Feishu API helpers
 │       ├── __init__.py
-│       └── session_store.py   # SQLite session storage
+│       └── feishu_utils.py
 ├── data/
-│   ├── sessions.db            # Session mappings (auto-created)
 │   └── docker_sessions.db     # Docker session mappings (auto-created)
 ├── test/
-│   └── call_claude_code.py    # Integration test
+│   ├── call_claude_code.py    # Claude integration test
+│   └── test_docker_session.py # Docker session test
+├── docs/
+│   └── GUEST_PROXY_INTEGRATION.md  # Container integration guide
 ├── config.yaml                # User configuration (gitignored)
 ├── config.example.yaml        # Configuration template
 ├── .env                       # Environment variables
@@ -324,7 +356,8 @@ python test/call_claude_code.py
 
 - `claude-agent-sdk` - Claude Code Python SDK
 - `lark-oapi` - Feishu/Lark official SDK
-- `pycryptodome` - AES encryption (webhook mode)
+- `redis` - Route management
+- `aiohttp` - HTTP server/client
 - `python-dotenv` - Environment management
 - `PyYAML` - Configuration file parsing
 
@@ -334,8 +367,6 @@ python test/call_claude_code.py
 2. Event subscription → Select "Use long connection"
 3. Add event: `im.message.receive_v1`
 4. Permissions: Configure the following `im:message` related permissions:
-
-### Required Permissions
 
 | Permission | Description |
 |------------|-------------|
@@ -351,5 +382,6 @@ python test/call_claude_code.py
 ## Known Limitations
 
 - No message rate limiting
-- Session cleanup not implemented (sessions accumulate in SQLite)
+- Session cleanup not implemented
 - No health check endpoint for WebSocket mode
+- Permission confirmation HTTP flow not fully implemented in Guest Proxy
