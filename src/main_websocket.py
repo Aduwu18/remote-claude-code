@@ -55,6 +55,7 @@ from src.permission_manager import format_permission_message
 from src.docker_session_manager import docker_session_manager
 from src.status_manager import StatusManager
 from src.protocol import PermissionParams
+from src.interceptor import init_interceptor, get_interceptor
 
 APP_ID = os.getenv("APP_ID")
 APP_SECRET = os.getenv("APP_SECRET")
@@ -77,6 +78,88 @@ _pending_docker_lock = threading.Lock()
 
 # 全局 Host Bridge 服务
 _host_bridge: Optional[HostBridgeServer] = None
+
+
+async def create_docker_session_handler(
+    user_id: str,
+    container_name: str,
+    original_chat_id: str
+) -> str:
+    """
+    创建 Docker 容器会话的回调函数
+
+    Args:
+        user_id: 用户 open_id
+        container_name: 容器名称
+        original_chat_id: 原始会话 chat_id
+
+    Returns:
+        结果消息
+    """
+    try:
+        # 1. 创建群聊
+        group_name = f"🐳 {container_name}"
+        docker_chat_id = create_group_chat(user_id, group_name)
+        logger.info(f"创建群聊: {docker_chat_id[:8]}... -> {container_name}")
+
+        # 2. 保存会话映射
+        docker_session_manager.create_docker_session(
+            original_chat_id=original_chat_id,
+            container_name=container_name,
+            user_open_id=user_id,
+            docker_chat_id=docker_chat_id
+        )
+
+        # 3. 发送欢迎消息到新群聊
+        welcome_msg = f"""🚀 已连接到容器 **{container_name}**
+
+现在你可以在这个群聊中与 Claude 交互，执行容器内的操作。
+
+💡 提示：
+- 直接发送消息即可与 Claude 对话
+- 发送 /exit 或「退出」结束会话"""
+
+        send_message(docker_chat_id, welcome_msg)
+
+        # 4. 通知原会话
+        send_message(
+            original_chat_id,
+            f"✅ 已创建容器会话\n"
+            f"容器: {container_name}\n"
+            f"请在新的群聊窗口中继续操作。"
+        )
+
+        return f"✅ 会话创建成功，请在群聊「{group_name}」中继续操作。"
+
+    except Exception as e:
+        logger.error(f"创建容器会话失败: {e}")
+        return f"❌ 创建会话失败: {e}"
+
+
+async def delete_docker_session_handler(chat_id: str) -> bool:
+    """
+    删除 Docker 容器会话的回调函数
+
+    Args:
+        chat_id: 容器会话 chat_id
+
+    Returns:
+        是否删除成功
+    """
+    try:
+        # 检查是否是 Docker 会话
+        if not docker_session_manager.is_docker_session(chat_id):
+            return False
+
+        # 删除路由和会话记录
+        redis_client.delete_route(chat_id)
+        docker_session_manager.delete_docker_session(chat_id)
+
+        return True
+
+    except Exception as e:
+        logger.error(f"删除容器会话失败: {e}")
+        return False
 
 
 async def handle_permission_request_from_guest(params: PermissionParams) -> bool:
@@ -308,6 +391,56 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 send_message(chat_id, "❌ 已拒绝操作")
                 return
 
+        # 尝试拦截管理命令
+        interceptor = get_interceptor()
+        intercepted = interceptor.try_intercept(sender_id, chat_id, text)
+        if intercepted:
+            # 检查是否需要异步处理
+            if isinstance(intercepted, tuple):
+                action = intercepted[0]
+                if action == "__ASYNC_CREATE_SESSION__":
+                    # 异步创建会话 - 放到线程中处理
+                    _, user_id, container_name, orig_chat_id = intercepted
+                    def _create_session():
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            result = loop.run_until_complete(
+                                create_docker_session_handler(user_id, container_name, orig_chat_id)
+                            )
+                            send_message(chat_id, result)
+                        except Exception as e:
+                            logger.error(f"创建会话失败: {e}")
+                            send_message(chat_id, f"❌ 创建会话失败: {e}")
+                        finally:
+                            loop.close()
+                    threading.Thread(target=_create_session, daemon=True).start()
+                    return
+                elif action == "__ASYNC_DELETE_SESSION__":
+                    # 异步删除会话
+                    _, session_chat_id = intercepted
+                    def _delete_session():
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            success = loop.run_until_complete(
+                                delete_docker_session_handler(session_chat_id)
+                            )
+                            if success:
+                                send_message(chat_id, "👋 已退出容器会话")
+                            else:
+                                send_message(chat_id, "⚠️ 当前不在容器会话中")
+                        except Exception as e:
+                            logger.error(f"退出会话失败: {e}")
+                            send_message(chat_id, f"❌ 退出会话失败: {e}")
+                        finally:
+                            loop.close()
+                    threading.Thread(target=_delete_session, daemon=True).start()
+                    return
+            else:
+                send_message(chat_id, intercepted)
+            return
+
         # 加入队列处理
         enqueue_message(chat_id, text, sender_id)
 
@@ -326,7 +459,15 @@ async def async_main():
         logger.error("Redis 连接失败，服务无法启动")
         return
 
-    # 2. 启动 Host Bridge HTTP 服务
+    # 2. 初始化协议拦截器
+    init_interceptor(
+        on_create_session=create_docker_session_handler,
+        on_delete_session=delete_docker_session_handler,
+        is_authorized=is_authorized,
+    )
+    logger.info("协议拦截器已初始化")
+
+    # 3. 启动 Host Bridge HTTP 服务
     bridge_config = get_host_bridge_config()
     _host_bridge = await start_host_bridge(
         port=bridge_config["port"],
