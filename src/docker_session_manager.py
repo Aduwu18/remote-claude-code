@@ -231,6 +231,61 @@ class DockerSessionManager:
         conn.close()
         return deleted
 
+    def get_session_info(self, chat_id: str) -> Optional[dict]:
+        """
+        获取容器会话的完整信息
+
+        Args:
+            chat_id: 容器会话的 chat_id
+
+        Returns:
+            会话信息字典或 None
+        """
+        conn = _get_conn()
+        cursor = conn.execute(
+            "SELECT docker_chat_id, original_chat_id, container_name, user_open_id, authorized_users, created_at FROM docker_sessions WHERE docker_chat_id = ?",
+            (chat_id,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            return {
+                "docker_chat_id": row[0],
+                "original_chat_id": row[1],
+                "container_name": row[2],
+                "user_open_id": row[3],
+                "authorized_users": json.loads(row[4]) if row[4] else [],
+                "created_at": row[5],
+            }
+        return None
+
+    def list_all_sessions(self) -> list[dict]:
+        """
+        列出所有容器会话
+
+        Returns:
+            会话信息列表
+        """
+        conn = _get_conn()
+        cursor = conn.execute(
+            "SELECT docker_chat_id, original_chat_id, container_name, user_open_id, authorized_users, created_at FROM docker_sessions"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        sessions = []
+        for row in rows:
+            sessions.append({
+                "docker_chat_id": row[0],
+                "original_chat_id": row[1],
+                "container_name": row[2],
+                "user_open_id": row[3],
+                "authorized_users": json.loads(row[4]) if row[4] else [],
+                "created_at": row[5],
+            })
+        return sessions
+
 
 # 全局单例
 docker_session_manager = DockerSessionManager()

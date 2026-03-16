@@ -271,6 +271,7 @@ class GuestProxyServer:
             RequestMethod.CHAT.value: self._handle_chat,
             RequestMethod.CHAT_STREAM.value: self._handle_chat,  # 流式聊天使用相同的处理器
             RequestMethod.HEALTH_CHECK.value: self._handle_health_check,
+            RequestMethod.CLEANUP_SESSION.value: self._handle_cleanup_session,
         }
         return handlers.get(method)
 
@@ -338,6 +339,35 @@ class GuestProxyServer:
             "container": self.container_name,
             "active_sessions": len(self._sessions),
         }
+
+    async def _handle_cleanup_session(self, params: dict) -> dict:
+        """
+        处理会话清理请求
+
+        Args:
+            params: 包含 chat_id 的参数字典
+
+        Returns:
+            清理结果
+        """
+        chat_id = params.get("chat_id")
+        if not chat_id:
+            return {"success": False, "error": "Missing chat_id"}
+
+        logger.info(f"收到会话清理请求: chat={chat_id[:8]}...")
+
+        # 检查是否存在该会话
+        if chat_id in self._sessions:
+            session_id, client = self._sessions.pop(chat_id)
+            try:
+                await client.disconnect()
+                logger.info(f"已清理会话: chat={chat_id[:8]}..., session={session_id[:8] if session_id else 'None'}...")
+            except Exception as e:
+                logger.warning(f"断开会话连接失败: {e}")
+            return {"success": True, "cleaned": True}
+        else:
+            logger.info(f"会话不存在，无需清理: chat={chat_id[:8]}...")
+            return {"success": True, "cleaned": False}
 
     async def _get_or_create_client(
         self,

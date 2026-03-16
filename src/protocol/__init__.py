@@ -37,6 +37,9 @@ class RequestMethod(str, Enum):
     REGISTER = "register"               # Guest 向 Host 注册
     UNREGISTER = "unregister"           # Guest 注销
 
+    # 会话清理
+    CLEANUP_SESSION = "cleanup_session" # 清理会话（Host -> Guest）
+
 
 class ResponseStatus(str, Enum):
     """响应状态枚举"""

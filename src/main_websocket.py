@@ -45,6 +45,9 @@ from lark_oapi.api.im.v1 import *
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger, P2CardActionTriggerResponse
 )
+# 群聊事件模型
+from lark_oapi.api.im.v1.model.p2_im_chat_disbanded_v1 import P2ImChatDisbandedV1
+from lark_oapi.api.im.v1.model.p2_im_chat_member_user_withdrawn_v1 import P2ImChatMemberUserWithdrawnV1
 
 from src.config import (
     is_authorized,
@@ -237,6 +240,154 @@ async def delete_docker_session_handler(chat_id: str) -> bool:
     except Exception as e:
         logger.error(f"删除容器会话失败: {e}")
         return False
+
+
+async def cleanup_session(chat_id: str, notify_original: bool = False) -> bool:
+    """
+    统一会话清理逻辑
+
+    Args:
+        chat_id: 容器会话 chat_id
+        notify_original: 是否通知原始会话
+
+    Returns:
+        是否清理成功
+    """
+    try:
+        # 检查是否是 Docker 会话
+        session_info = docker_session_manager.get_session_info(chat_id)
+        if not session_info:
+            logger.info(f"会话不存在，无需清理: {chat_id[:8]}...")
+            return False
+
+        container_name = session_info.get("container_name")
+        original_chat_id = session_info.get("original_chat_id")
+
+        # 1. 获取 endpoint（清理前需要）
+        endpoint = redis_client.get_route(chat_id)
+
+        # 2. 删除 Redis 路由
+        redis_client.delete_route(chat_id)
+        logger.info(f"已删除 Redis 路由: {chat_id[:8]}...")
+
+        # 3. 删除数据库记录
+        docker_session_manager.delete_docker_session(chat_id)
+        logger.info(f"已删除数据库记录: {chat_id[:8]}...")
+
+        # 4. 通知 Guest Proxy 清理 Claude Session
+        if endpoint:
+            try:
+                async with GuestProxyClient() as client:
+                    success = await client.cleanup_session(endpoint, chat_id)
+                    if success:
+                        logger.info(f"已通知 Guest Proxy 清理会话: {container_name}")
+            except Exception as e:
+                logger.warning(f"通知 Guest Proxy 清理失败: {e}")
+
+        # 5. 可选：通知原始会话
+        if notify_original and original_chat_id:
+            try:
+                send_markdown_message(
+                    original_chat_id,
+                    f"🔔 容器 **{container_name}** 的会话已结束。"
+                )
+            except Exception as e:
+                logger.warning(f"通知原始会话失败: {e}")
+
+        logger.info(f"会话清理完成: {chat_id[:8]}... -> {container_name}")
+        return True
+
+    except Exception as e:
+        logger.error(f"清理会话失败: {e}")
+        return False
+
+
+def handle_member_withdrawn(data: P2ImChatMemberUserWithdrawnV1) -> None:
+    """
+    处理群成员退出事件
+
+    当用户退出群聊时触发，清理对应的 Docker 会话。
+
+    Args:
+        data: 事件数据
+    """
+    try:
+        event = data.event
+        chat_id = event.chat.chat_id
+        operator_id = event.operator.open_id
+
+        logger.info(f"群成员退出事件: chat={chat_id[:8]}..., user={operator_id[:8]}...")
+
+        # 检查是否是 Docker 会话
+        if not docker_session_manager.is_docker_session(chat_id):
+            return
+
+        # 获取会话信息
+        session_info = docker_session_manager.get_session_info(chat_id)
+        if not session_info:
+            return
+
+        authorized_users = session_info.get("authorized_users", [])
+
+        # 如果退出的是授权用户，清理会话
+        if operator_id in authorized_users:
+            logger.info(f"授权用户退出群聊，清理会话: {operator_id[:8]}...")
+
+            # 异步执行清理
+            def _cleanup():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(cleanup_session(chat_id, notify_original=True))
+                except Exception as e:
+                    logger.error(f"清理会话失败: {e}")
+                finally:
+                    loop.close()
+
+            threading.Thread(target=_cleanup, daemon=True).start()
+
+    except Exception as e:
+        logger.error(f"处理群成员退出事件失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def handle_chat_disbanded(data: P2ImChatDisbandedV1) -> None:
+    """
+    处理群聊解散事件
+
+    当群聊被解散时触发，清理对应的 Docker 会话。
+
+    Args:
+        data: 事件数据
+    """
+    try:
+        event = data.event
+        chat_id = event.chat.chat_id
+
+        logger.info(f"群聊解散事件: chat={chat_id[:8]}...")
+
+        # 检查是否是 Docker 会话
+        if not docker_session_manager.is_docker_session(chat_id):
+            return
+
+        # 异步执行清理
+        def _cleanup():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(cleanup_session(chat_id, notify_original=True))
+            except Exception as e:
+                logger.error(f"清理会话失败: {e}")
+            finally:
+                loop.close()
+
+        threading.Thread(target=_cleanup, daemon=True).start()
+
+    except Exception as e:
+        logger.error(f"处理群聊解散事件失败: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 async def handle_permission_request_from_guest(params: PermissionParams) -> bool:
@@ -652,6 +803,8 @@ async def async_main():
         event_handler=lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(handle_message)
             .register_p2_card_action_trigger(handle_card_action)
+            .register_p2_im_chat_member_user_withdrawn_v1(handle_member_withdrawn)
+            .register_p2_im_chat_disbanded_v1(handle_chat_disbanded)
             .build(),
         log_level=lark.LogLevel.INFO,
     )

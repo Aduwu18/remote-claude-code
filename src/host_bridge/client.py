@@ -193,6 +193,47 @@ class GuestProxyClient:
         except Exception:
             return False
 
+    async def cleanup_session(self, endpoint: str, chat_id: str) -> bool:
+        """
+        通知 Guest Proxy 清理会话
+
+        Args:
+            endpoint: Guest Proxy 端点 (http://host:port)
+            chat_id: 聊天 ID
+
+        Returns:
+            是否成功
+        """
+        if self._session is None:
+            await self.connect()
+
+        request = JsonRpcRequest(
+            method=RequestMethod.CLEANUP_SESSION.value,
+            params={"chat_id": chat_id},
+        )
+
+        try:
+            async with self._session.post(
+                f"{endpoint}/rpc",
+                json=request.to_dict(),
+            ) as response:
+                if response.status != 200:
+                    text = await response.text()
+                    logger.warning(f"清理会话请求失败: {response.status} - {text}")
+                    return False
+
+                data = await response.json()
+                if data.get("error"):
+                    logger.warning(f"清理会话错误: {data['error']}")
+                    return False
+
+                logger.info(f"会话清理成功: {chat_id[:8]}...")
+                return True
+
+        except Exception as e:
+            logger.warning(f"清理会话异常: {e}")
+            return False
+
     async def chat_stream(
         self,
         endpoint: str,

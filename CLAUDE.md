@@ -197,6 +197,29 @@ The system uses **streaming responses** for real-time feedback during long-runni
 
 Redis stores `chat_id -> endpoint` mapping. Docker sessions create dedicated group chats named "🐳 {container_name}".
 
+### Session Cleanup
+
+When users leave group chats or chats are disbanded, the system automatically cleans up:
+
+**Triggers:**
+- User withdraws from group chat (`im.chat.member.user_withdrawn_v1`)
+- Group chat is disbanded (`im.chat.disbanded_v1`)
+- User sends `/exit` command
+
+**Cleanup Process:**
+1. Delete Redis route (`chat_id -> endpoint`)
+2. Delete SQLite session record
+3. Notify Guest Proxy to clean up Claude session
+
+**Implementation:**
+- `handle_member_withdrawn()` - Handles user withdrawal events
+- `handle_chat_disbanded()` - Handles chat disband events
+- `cleanup_session()` - Unified cleanup logic
+
+**Required Feishu Permissions:**
+- Subscribe to `im.chat.member.user_withdrawn_v1` event
+- Subscribe to `im.chat.disbanded_v1` event
+
 ### Permission Model
 
 1. **User Authorization**: `authorized_users` in `config.yaml` controls who can use the bot
@@ -232,7 +255,7 @@ All Host-Guest communication uses JSON-RPC 2.0:
 }
 ```
 
-**Key methods:** `chat`, `chat_stream`, `register`, `permission`, `status_update`, `heartbeat`
+**Key methods:** `chat`, `chat_stream`, `register`, `permission`, `status_update`, `heartbeat`, `cleanup_session`
 
 ### 2. Protocol Interceptor (`src/interceptor.py`)
 
