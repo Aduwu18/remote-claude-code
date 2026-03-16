@@ -92,6 +92,23 @@ permission:
 | `src/feishu_utils/card_builder.py` | Card message builder (interactive cards, buttons, status updates) |
 | `src/status_manager.py` | Status message management with card-based in-place updates |
 
+### HTTP Endpoints
+
+**Host Bridge (`:8080`)**:
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/rpc` | POST | JSON-RPC 2.0 requests (register, permission, status_update, heartbeat) |
+| `/health` | GET | Health check (returns Redis connection status) |
+| `/routes` | GET | List all chat_id -> endpoint routes |
+| `/permission_response` | POST | Receive permission response from Feishu |
+
+**Guest Proxy (`:8081` in containers)**:
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/rpc` | POST | JSON-RPC 2.0 requests (chat, health_check) |
+| `/stream` | POST | Streaming chat (NDJSON response) |
+| `/health` | GET | Health check (returns container name, active sessions) |
+
 ### Request Flow
 
 ```
@@ -125,12 +142,6 @@ The system uses **streaming responses** for real-time feedback during long-runni
                  │ (实时更新)    │
                  └──────────────┘
 ```
-
-**Key Components:**
-- **NDJSON Stream**: Guest Proxy sends newline-delimited JSON events
-- **Heartbeat**: 5-second heartbeats keep HTTP connection alive
-- **Status Updates**: Real-time updates to Feishu status cards (5s interval)
-- **30-minute timeout**: Total streaming timeout of 30 minutes
 
 **Stream Event Types:**
 | Event | Description |
@@ -383,6 +394,9 @@ python test/call_claude_code.py
 
 # Test Docker session creation
 python test/test_docker_session.py
+
+# Test streaming response
+python test/test_streaming.py
 ```
 
 ## Project Structure
@@ -417,7 +431,8 @@ python test/test_docker_session.py
 │   └── docker_sessions.db     # Docker session mappings (auto-created)
 ├── test/
 │   ├── call_claude_code.py    # Claude integration test
-│   └── test_docker_session.py # Docker session test
+│   ├── test_docker_session.py # Docker session test
+│   └── test_streaming.py      # Streaming response test
 ├── docs/
 │   └── GUEST_PROXY_INTEGRATION.md  # Container integration guide
 ├── config.yaml                # User configuration (gitignored)
@@ -435,6 +450,8 @@ python test/test_docker_session.py
 - `aiohttp` - HTTP server/client
 - `python-dotenv` - Environment management
 - `PyYAML` - Configuration file parsing
+- `pycryptodome` - Encryption for Feishu message verification
+- `nest-asyncio` - Nested event loop support
 
 ## Feishu App Configuration
 
