@@ -1,17 +1,15 @@
 # Claude Code 飞书机器人
 
-将 Claude Code 接入飞书，实现 Docker 容器操作助手功能。
+将 Claude Code CLI 接入飞书，实现 Docker 容器操作助手功能。采用 **Host-Guest 架构** 实现深度环境隔离。
 
 ## 架构概述
 
-采用 Host-Guest 架构，实现深度环境隔离：
-
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                        Host Bridge (无状态网关)                          │
+│                        Host Bridge (宿主机网关)                          │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐      │
-│  │ WebSocket    │    │ Redis        │    │ Permission           │      │
-│  │ (飞书长连接)  │    │ (路由索引)    │    │ Forwarder            │      │
+│  │ WebSocket    │    │ Redis        │    │ HTTP Server          │      │
+│  │ (飞书长连接)  │    │ (路由索引)    │    │ :8080 (RPC + 注册)   │      │
 │  └──────┬───────┘    └──────┬───────┘    └──────────┬───────────┘      │
 │         │                   │                       │                   │
 │         └───────────────────┼───────────────────────┘                   │
@@ -48,8 +46,17 @@
 - 支持多容器并行操作
 
 **权限确认**
-- 敏感操作（写文件、执行命令）需要用户确认
-- 飞书端实时弹窗，回复 "y/n" 控制
+- 敏感操作（Write, Edit, Bash）需要用户确认
+- 卡片消息交互 + 文本回复 "y/n" 双重确认
+
+**流式响应**
+- 实时状态更新（卡片原地更新）
+- 工具调用进度反馈
+- 长消息自动分块
+
+**会话清理**
+- 用户退群/群解散自动清理
+- `/exit` 命令手动退出
 
 **异常感知**
 - Watchdog 监控任务状态
@@ -59,7 +66,7 @@
 
 ### 前置条件
 
-- Python 3.11+
+- Python 3.10+
 - Redis（本地或 Docker）
 - 飞书应用（需提前创建）
 - 目标容器内 Python 3.11（与预编译 libs 匹配）
@@ -187,29 +194,61 @@ curl http://localhost:8081/health
 
 ---
 
-### 进程管理（可选）
+## 使用示例
 
-**Supervisor 配置：**
-```ini
-[program:guest-proxy]
-command=/opt/guest-proxy/start.sh
-directory=/opt/guest-proxy
-autostart=true
-autorestart=true
-stderr_logfile=/var/log/guest-proxy.err.log
-stdout_logfile=/var/log/guest-proxy.out.log
-environment=HOST_BRIDGE_URL="http://host.docker.internal:8080"
+### 创建容器会话
+
+在飞书中发送：
+
+```
+进入 nginx 容器
 ```
 
-**嵌入应用启动：**
-```python
-import asyncio
-from guest_proxy.server import GuestProxyServer
+或使用命令格式：
 
-async def main():
-    server = GuestProxyServer()
-    await server.start()
-    # 继续应用逻辑...
+```
+/start nginx
+```
+
+系统会创建专属群聊 "🐳 nginx"，在新窗口中操作容器。
+
+### 容器内操作
+
+```
+查看 /app 目录
+读取 config.json
+运行 python script.py
+```
+
+### 权限确认
+
+当 Claude 执行敏感操作时，会发送卡片消息：
+
+```
+🔒 权限确认请求
+
+操作: Write
+详情:
+{
+  "file_path": "/app/config.json",
+  "content": "{...}"
+}
+
+[✅ 允许]  [❌ 拒绝]
+```
+
+点击按钮或回复 "y"/"n" 确认。
+
+### 退出容器会话
+
+```
+/exit
+```
+
+或：
+
+```
+退出
 ```
 
 ---
@@ -219,7 +258,10 @@ async def main():
 1. 进入 [飞书开放平台](https://open.feishu.cn/)
 2. 创建应用，获取 APP_ID 和 APP_SECRET
 3. **事件订阅** → 选择「使用长连接接收事件」
-4. **添加事件**: `im.message.receive_v1`
+4. **添加事件**:
+   - `im.message.receive_v1` - 接收消息
+   - `im.chat.member.user_withdrawn_v1` - 用户退群（会话清理）
+   - `im.chat.disbanded_v1` - 群解散（会话清理）
 5. **权限管理** → 添加以下权限：
 
 | 权限 | 说明 |
@@ -233,86 +275,85 @@ async def main():
 
 6. **发布版本** - 添加权限后必须发布应用版本才能生效
 
-## 使用示例
-
-**创建容器会话：**
-
-```
-进入 nginx 容器
-```
-
-系统会创建专属群聊 "🐳 nginx (Claude助手)"，在新窗口中操作容器。
-
-**容器内操作：**
-
-```
-查看 /app 目录
-读取 config.json
-运行 python script.py
-```
-
-**权限确认：**
-
-```
-🔒 权限确认请求
-
-操作: Write
-详情:
-{
-  "file_path": "/app/config.json",
-  "content": "{...}"
-}
-
-请回复:
-• "y" 或 "确认" - 允许执行
-• "n" 或 "拒绝" - 拒绝执行
-```
-
-**退出容器会话：**
-
-```
-/exit
-```
+---
 
 ## 项目结构
 
 ```
 src/
-├── main_websocket.py        # 主入口（Host Bridge + WebSocket）
-├── redis_client.py          # Redis 客户端封装
-├── config.py                # 配置加载与用户授权
-├── permission_manager.py    # 权限确认状态管理
-├── docker_session_manager.py # Docker 会话持久化
-├── status_manager.py        # 状态消息管理
-├── protocol/                # 通信协议定义
+├── main_websocket.py          # 主入口（Host Bridge + WebSocket）
+├── config.py                  # 配置加载与用户授权
+├── redis_client.py            # Redis 路由管理
+├── interceptor.py             # 协议拦截器（管理命令）
+├── docker_session_manager.py  # Docker 会话持久化
+├── permission_manager.py      # 权限确认状态管理
+├── status_manager.py          # 状态消息管理（卡片更新）
+├── protocol/                  # JSON-RPC 2.0 协议定义
 │   └── __init__.py
-├── host_bridge/             # Host Bridge 模块
+├── host_bridge/               # Host Bridge 模块（宿主机）
 │   ├── __init__.py
-│   ├── server.py            # HTTP 服务
-│   └── client.py            # Guest Proxy 客户端
-├── guest_proxy/             # Guest Proxy 模块（容器内运行）
+│   ├── server.py              # HTTP 服务
+│   └── client.py              # Guest Proxy 客户端
+├── guest_proxy/               # Guest Proxy 模块（容器内）
 │   ├── __init__.py
-│   ├── server.py            # HTTP 服务
-│   ├── claude_client.py     # Claude SDK 封装
-│   ├── status_handler.py    # 状态处理
-│   ├── watchdog.py          # 异常监控
-│   └── config.py            # 配置
-└── feishu_utils/            # 飞书工具
-    └── feishu_utils.py
+│   ├── server.py              # HTTP 服务
+│   ├── claude_client.py       # Claude SDK 封装
+│   ├── status_handler.py      # 状态处理
+│   ├── watchdog.py            # 异常监控
+│   └── config.py              # 配置
+└── feishu_utils/              # 飞书工具
+    ├── __init__.py
+    ├── feishu_utils.py        # 消息 API
+    └── card_builder.py        # 卡片消息构建器
 
 data/
-└── docker_sessions.db       # Docker 会话数据库
+└── docker_sessions.db         # Docker 会话数据库（自动创建）
 
-deploy/                      # 可插拔部署配置
+deploy/                        # 可插拔部署配置
 ├── docker-compose.guest-proxy.yml
 ├── Dockerfile.overlay
 ├── README.md
 ├── requirements-guest-proxy.txt
 └── start-guest-proxy.sh
 
-docs/                        # 文档
-└── GUEST_PROXY_INTEGRATION.md
+docs/
+└── GUEST_PROXY_INTEGRATION.md # 容器集成详细指南
 ```
+
+---
+
+## HTTP 端点
+
+### Host Bridge (`:8080`)
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/rpc` | POST | JSON-RPC 请求（register, permission, status_update, heartbeat） |
+| `/health` | GET | 健康检查（返回 Redis 连接状态） |
+| `/routes` | GET | 列出所有路由 |
+| `/permission_response` | POST | 接收权限响应 |
+
+### Guest Proxy (`:8081`)
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/rpc` | POST | JSON-RPC 请求（chat, health_check, cleanup_session） |
+| `/stream` | POST | 流式聊天（NDJSON 响应） |
+| `/health` | GET | 健康检查（返回容器名、活跃会话数） |
+
+---
+
+## 管理命令
+
+| 命令 | 说明 | 自然语言 |
+|------|------|----------|
+| `/ls` | 列出所有容器 | 列出容器 / 查看容器 |
+| `/start <名称>` | 进入容器会话 | 进入 xxx 容器 |
+| `/enter <名称>` | 进入容器会话 | 进入 xxx |
+| `/exit` | 退出容器会话 | 退出 / 退出容器 |
+| `/help` | 显示帮助 | - |
+
+---
 
 ## 技术栈
 
@@ -321,8 +362,36 @@ docs/                        # 文档
 - lark-oapi（飞书 SDK）
 - Redis（路由索引）
 - aiohttp（HTTP 服务）
+- Docker（容器隔离）
+
+---
 
 ## 更多文档
 
 - [Guest Proxy 集成指南](docs/GUEST_PROXY_INTEGRATION.md) - 详细的容器集成配置
 - [部署配置](deploy/README.md) - Docker Compose 和 Dockerfile 模板
+
+---
+
+## 常见问题
+
+### Q: 为什么容器内无法连接 Host Bridge？
+
+检查网络配置：
+```bash
+# 容器内测试
+curl http://host.docker.internal:8080/health
+
+# Linux 需要添加 extra_hosts
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+### Q: 为什么权限确认没有响应？
+
+1. 检查飞书应用是否订阅了「卡片回传交互」事件
+2. 检查日志中是否有 `P2CardActionTrigger` 回调
+
+### Q: 长消息被截断怎么办？
+
+系统会自动分块发送超过 10KB 的消息。如果仍有问题，检查日志中的 `split_long_message` 输出。

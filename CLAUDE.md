@@ -55,6 +55,25 @@ tail -f log.log
 | `APP_SECRET` | Yes | Feishu application secret |
 | `ANTHROPIC_API_KEY` | Yes | Claude API key (for Guest Proxy) |
 
+## Development Commands
+
+```bash
+# Run Host Bridge (foreground, for debugging)
+python -m src.main_websocket
+
+# Run tests
+python test/call_claude_code.py          # Claude SDK integration test
+python test/test_docker_session.py       # Docker session creation test
+python test/test_streaming.py            # Streaming response test
+
+# Syntax check all modified modules
+python -m py_compile src/main_websocket.py src/protocol/__init__.py src/docker_session_manager.py
+
+# Health checks
+curl http://localhost:8080/health        # Host Bridge
+curl http://localhost:8081/health        # Guest Proxy (in container)
+```
+
 ## Configuration (`config.yaml`)
 
 ```yaml
@@ -409,19 +428,6 @@ See `docs/GUEST_PROXY_INTEGRATION.md` for:
 - Network configuration
 - Health checks
 
-## Testing
-
-```bash
-# Test Claude Code integration (requires ANTHROPIC_API_KEY)
-python test/call_claude_code.py
-
-# Test Docker session creation
-python test/test_docker_session.py
-
-# Test streaming response
-python test/test_streaming.py
-```
-
 ## Project Structure
 
 ```
@@ -480,7 +486,10 @@ python test/test_streaming.py
 
 1. Create app at [Feishu Open Platform](https://open.feishu.cn/)
 2. Event subscription → Select "Use long connection"
-3. Add event: `im.message.receive_v1`
+3. Add events:
+   - `im.message.receive_v1` - Receive messages
+   - `im.chat.member.user_withdrawn_v1` - User leaves group (for session cleanup)
+   - `im.chat.disbanded_v1` - Group disbanded (for session cleanup)
 4. Permissions: Configure the following `im:message` related permissions:
 
 | Permission | Description |
@@ -497,6 +506,4 @@ python test/test_streaming.py
 ## Known Limitations
 
 - No message rate limiting
-- Session cleanup not implemented
 - No health check endpoint for WebSocket mode
-- Permission confirmation HTTP flow not fully implemented in Guest Proxy
