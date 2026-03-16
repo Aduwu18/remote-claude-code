@@ -40,6 +40,10 @@ class RequestMethod(str, Enum):
     # 会话清理
     CLEANUP_SESSION = "cleanup_session" # 清理会话（Host -> Guest）
 
+    # Terminal 注册
+    REGISTER_TERMINAL = "register_terminal"  # Terminal 注册请求
+    BIND_TERMINAL = "bind_terminal"          # 绑定 Terminal 到 chat_id
+
 
 class ResponseStatus(str, Enum):
     """响应状态枚举"""
@@ -373,3 +377,39 @@ class RegisterParams:
             chat_id=data["chat_id"],
             user_open_id=data["user_open_id"],
         )
+
+
+@dataclass
+class BindTerminalParams:
+    """绑定 Terminal 参数"""
+    code: str
+    chat_id: str
+
+    def to_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "chat_id": self.chat_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'BindTerminalParams':
+        return cls(
+            code=data["code"],
+            chat_id=data["chat_id"],
+        )
+
+
+@dataclass
+class BindTerminalResult:
+    """绑定 Terminal 结果"""
+    success: bool
+    message: Optional[str] = None
+    endpoint: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        result = {"success": self.success}
+        if self.message:
+            result["message"] = self.message
+        if self.endpoint:
+            result["endpoint"] = self.endpoint
+        return result

@@ -58,6 +58,7 @@ from src.config import (
 from src.redis_client import init_redis, redis_client
 from src.host_bridge import start_host_bridge, GuestProxyClient
 from src.host_bridge.server import HostBridgeServer
+from src.local_session_bridge import LocalSessionBridge
 from src.feishu_utils.feishu_utils import send_message, create_group_chat, send_card_message, send_markdown_message
 from src.permission_manager import format_permission_message, build_permission_card_json
 from src.docker_session_manager import docker_session_manager
@@ -87,6 +88,9 @@ _pending_docker_lock = threading.Lock()
 # 全局 Host Bridge 服务
 _host_bridge: Optional[HostBridgeServer] = None
 
+# 全局 Local Session Bridge 服务
+_local_bridge: Optional[LocalSessionBridge] = None
+
 # 全局 shutdown 事件
 _shutdown_event = asyncio.Event()
 
@@ -99,7 +103,7 @@ def _signal_handler():
 
 def _cleanup_on_exit():
     """进程退出时的清理函数（atexit 备份机制）"""
-    global _host_bridge
+    global _host_bridge, _local_bridge
     if _host_bridge:
         try:
             # 同步版本的清理
@@ -112,6 +116,17 @@ def _cleanup_on_exit():
             logger.info("atexit 清理完成")
         except Exception as e:
             logger.error(f"atexit 清理失败: {e}")
+    if _local_bridge:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_local_bridge.stop())
+            finally:
+                loop.close()
+            logger.info("Local Bridge atexit 清理完成")
+        except Exception as e:
+            logger.error(f"Local Bridge atexit 清理失败: {e}")
 
 
 async def create_docker_session_handler(
@@ -239,6 +254,43 @@ async def delete_docker_session_handler(chat_id: str) -> bool:
 
     except Exception as e:
         logger.error(f"删除容器会话失败: {e}")
+        return False
+
+
+async def bind_terminal_handler(code: str, chat_id: str) -> bool:
+    """
+    绑定 Terminal session 到 chat_id
+
+    Args:
+        code: 注册码
+        chat_id: 飞书聊天 ID
+
+    Returns:
+        是否绑定成功
+    """
+    global _local_bridge
+
+    if not _local_bridge:
+        logger.error("Local Session Bridge 未启动")
+        return False
+
+    try:
+        # 调用 Local Bridge 的绑定接口
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"http://localhost:8082/bind",
+                json={"code": code, "chat_id": chat_id},
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"绑定请求失败: HTTP {resp.status}")
+                    return False
+
+                result = await resp.json()
+                return result.get("success", False)
+
+    except Exception as e:
+        logger.error(f"绑定 Terminal 失败: {e}")
         return False
 
 
@@ -681,6 +733,27 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                             loop.close()
                     threading.Thread(target=_delete_session, daemon=True).start()
                     return
+                elif action == "__ASYNC_BIND_TERMINAL__":
+                    # 异步绑定 Terminal
+                    _, code, bind_chat_id = intercepted
+                    def _bind_terminal():
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            success = loop.run_until_complete(
+                                bind_terminal_handler(code, bind_chat_id)
+                            )
+                            if success:
+                                send_markdown_message(chat_id, f"✅ Terminal 已绑定\n注册码: {code}\n\n现在可以在 Terminal 中发送消息，权限确认会在此聊天中弹出。")
+                            else:
+                                send_markdown_message(chat_id, f"❌ 绑定失败\n注册码无效或已过期，请检查后重试。")
+                        except Exception as e:
+                            logger.error(f"绑定 Terminal 失败: {e}")
+                            send_markdown_message(chat_id, f"❌ 绑定失败: {e}")
+                        finally:
+                            loop.close()
+                    threading.Thread(target=_bind_terminal, daemon=True).start()
+                    return
             else:
                 send_markdown_message(chat_id, intercepted)
             return
@@ -765,7 +838,7 @@ def handle_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse
 
 async def async_main():
     """异步主函数"""
-    global _host_bridge
+    global _host_bridge, _local_bridge
 
     # 注册 atexit 清理（备份机制）
     atexit.register(_cleanup_on_exit)
@@ -785,6 +858,7 @@ async def async_main():
         on_create_session=create_docker_session_handler,
         on_delete_session=delete_docker_session_handler,
         is_authorized=is_authorized,
+        on_bind_terminal=bind_terminal_handler,
     )
     logger.info("协议拦截器已初始化")
 
@@ -796,7 +870,15 @@ async def async_main():
         on_status_update=handle_status_update,
     )
 
-    # 3. 创建 WebSocket 客户端
+    # 4. 启动 Local Session Bridge
+    _local_bridge = LocalSessionBridge(
+        port=8082,
+        host_bridge_url=f"http://localhost:{bridge_config['port']}",
+    )
+    await _local_bridge.start()
+    logger.info("Local Session Bridge 已启动，端口: 8082")
+
+    # 5. 创建 WebSocket 客户端
     client = lark.ws.Client(
         APP_ID,
         APP_SECRET,
@@ -812,8 +894,10 @@ async def async_main():
     logger.info("启动飞书长连接...")
     logger.info(f"已配置授权用户数: {len(get_authorized_users())}")
     logger.info(f"Host Bridge 端口: {bridge_config['port']}")
+    logger.info("Local Session Bridge 端口: 8082")
+    logger.info("Terminal 注册: python -m src.terminal_client --register")
 
-    # 4. 在后台线程运行 WebSocket
+    # 6. 在后台线程运行 WebSocket
     ws_thread = threading.Thread(target=client.start, daemon=True)
     ws_thread.start()
 
@@ -822,6 +906,7 @@ async def async_main():
         await _shutdown_event.wait()
     finally:
         logger.info("正在停止服务...")
+        await _local_bridge.stop()
         await _host_bridge.stop()
         redis_client.close()
         logger.info("服务已停止")

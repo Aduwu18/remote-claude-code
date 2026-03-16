@@ -12,14 +12,20 @@ A Feishu (飞书) bot that integrates Claude Code CLI, enabling users to interac
 │  WebSocket   │───►│ Redis Router │───►│ Guest Proxy  │
 │  (飞书消息)   │    │  (路由索引)   │    │ (容器内服务)  │
 └──────────────┘    └──────────────┘    └──────────────┘
+       │
+       │         ┌──────────────┐
+       └────────►│ Local Bridge │◄─────── Terminal CLI
+                 │  (Terminal)   │
+                 └──────────────┘
 ```
 
 **Core Features:**
 - Guest Proxy runs inside Docker containers, inheriting `.bashrc`, venv, and environment
 - Redis stores `chat_id -> container_endpoint` routing
 - Permission confirmation via Feishu messages for sensitive operations (Write, Edit, Bash)
-- Protocol interceptor for management commands (`/ls`, `/start`, `/exit`)
+- Protocol interceptor for management commands (`/ls`, `/start`, `/exit`, `/bind-terminal`)
 - Independent Claude sessions per container
+- **Terminal-Feishu Session Sync**: Terminal CLI can bind to Feishu chat for permission confirmations
 
 ## Quick Start
 
@@ -72,6 +78,41 @@ python -m py_compile src/main_websocket.py src/protocol/__init__.py src/docker_s
 # Health checks
 curl http://localhost:8080/health        # Host Bridge
 curl http://localhost:8081/health        # Guest Proxy (in container)
+curl http://localhost:8082/health        # Local Session Bridge
+```
+
+## Terminal-Feishu Session Sync
+
+Terminal CLI can bind to a Feishu chat for permission confirmations:
+
+```bash
+# 1. Start the Host Bridge (includes Local Session Bridge)
+python -m src.main_websocket
+
+# 2. Register Terminal
+python -m src.terminal_client --register
+# Output: 注册码: ABC123
+#         请在飞书发送: /bind-terminal ABC123
+
+# 3. In Feishu, send the bind command
+/bind-terminal ABC123
+
+# 4. Use Terminal CLI
+python -m src.terminal_client
+# Messages sent here will trigger permission popups in Feishu
+```
+
+**Architecture:**
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│ Terminal CLI    │───►│ Local Bridge    │───►│ Host Bridge     │
+│ (用户输入)       │    │ (:8082)         │    │ (:8080)         │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+                                                      │
+                                                      ▼
+                                               ┌─────────────────┐
+                                               │ Feishu 权限卡片  │
+                                               └─────────────────┘
 ```
 
 ## Configuration (`config.yaml`)
@@ -98,11 +139,14 @@ permission:
 |--------|---------|
 | `src/main_websocket.py` | Main entry - WebSocket handler + Host Bridge initialization |
 | `src/host_bridge/server.py` | HTTP server for Guest Proxy registration and permission forwarding |
+| `src/local_session_bridge/server.py` | Local Session Bridge for Terminal CLI connections |
+| `src/local_session_bridge/claude_client.py` | Local Claude client with permission forwarding |
+| `src/terminal_client/client.py` | Terminal CLI client for interacting with Local Bridge |
 | `src/host_bridge/client.py` | HTTP client for communicating with Guest Proxy |
 | `src/guest_proxy/server.py` | HTTP server running inside Docker containers |
 | `src/guest_proxy/claude_client.py` | Claude Code SDK wrapper with permission callbacks |
 | `src/protocol/__init__.py` | JSON-RPC 2.0 protocol definitions (requests, responses, error codes) |
-| `src/interceptor.py` | Protocol interceptor for management commands (`/ls`, `/start`, `/exit`) |
+| `src/interceptor.py` | Protocol interceptor for management commands (`/ls`, `/start`, `/exit`, `/bind-terminal`) |
 | `src/redis_client.py` | Redis client for route management (`chat_id -> endpoint`) |
 | `src/docker_session_manager.py` | Docker session persistence (SQLite) |
 | `src/permission_manager.py` | Permission confirmation state management |
@@ -127,6 +171,16 @@ permission:
 | `/rpc` | POST | JSON-RPC 2.0 requests (chat, health_check) |
 | `/stream` | POST | Streaming chat (NDJSON response) |
 | `/health` | GET | Health check (returns container name, active sessions) |
+
+**Local Session Bridge (`:8082`)**:
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/rpc` | POST | JSON-RPC 2.0 requests (chat, health_check) |
+| `/stream` | POST | Streaming chat (NDJSON response) |
+| `/health` | GET | Health check (returns active sessions, pending registers) |
+| `/register` | POST | Generate registration code for Terminal binding |
+| `/bind` | POST | Bind registration code to chat_id |
+| `/status` | GET | Detailed status including session list |
 
 ### Request Flow
 
