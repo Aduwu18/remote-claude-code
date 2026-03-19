@@ -3,6 +3,9 @@ import re
 import requests
 import json
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 app_id = os.getenv('APP_ID')
 app_secret = os.getenv('APP_SECRET')
@@ -439,6 +442,130 @@ def send_long_message(
         responses.append(res)
 
     return responses
+
+
+def disband_group_chat(chat_id: str, access_token=None) -> bool:
+    """
+    解散群聊
+
+    需要飞书应用开通 im:chat:write 权限
+
+    API: POST /im/v1/chats/{chat_id}/disband
+    文档: https://open.feishu.cn/document/server-docs/group/chat/disband
+
+    Args:
+        chat_id: 群聊 ID
+        access_token: 访问令牌（可选）
+
+    Returns:
+        bool: True 表示解散成功，False 表示失败
+
+    Raises:
+        Exception: 解散失败时抛出异常
+    """
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    url = f'https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}/disband'
+    res = requests.post(url, headers=get_headers(access_token)).json()
+    if res['code'] != 0:
+        # 群聊不存在或已解散，视为成功
+        if res['code'] == 230001:
+            logger.warning(f'群聊 {chat_id} 不存在或已解散')
+            return True
+        raise Exception(f'解散群聊失败: {json.dumps(res, ensure_ascii=False)}')
+    return True
+
+
+def get_chat_info(chat_id: str, access_token=None) -> dict:
+    """
+    获取群聊信息
+
+    API: GET /im/v1/chats/{chat_id}
+    文档: https://open.feishu.cn/document/server-docs/group/chat/get
+
+    Args:
+        chat_id: 群聊 ID
+        access_token: 访问令牌（可选）
+
+    Returns:
+        dict: 群聊信息，包含 chat_id, name, description 等
+              如果群聊不存在返回 None
+
+    Raises:
+        Exception: 获取信息失败时抛出异常
+    """
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    url = f'https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}'
+    res = requests.get(url, headers=get_headers(access_token)).json()
+    if res['code'] != 0:
+        # 群聊不存在
+        if res['code'] == 230001:
+            return None
+        raise Exception(f'获取群聊信息失败: {json.dumps(res, ensure_ascii=False)}')
+    return res['data']
+
+
+def send_terminal_status_card(
+    chat_id: str,
+    status: str,
+    details: dict,
+    access_token=None
+) -> dict:
+    """
+    发送终端状态卡片
+
+    Args:
+        chat_id: 群聊 ID
+        status: 状态类型 (started, running, idle, stopped, error)
+        details: 状态详情，包含:
+            - terminal_id: 终端 ID
+            - hostname: 主机名
+            - message: 状态消息
+            - session_id: 会话 ID（可选）
+
+    Returns:
+        dict: API 响应
+    """
+    from src.feishu_utils.card_builder import CardBuilder
+
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    # 状态配置
+    status_config = {
+        "started": {"icon": "🚀", "template": "green", "text": "终端已启动"},
+        "running": {"icon": "⏳", "template": "blue", "text": "正在执行"},
+        "idle": {"icon": "💤", "template": "grey", "text": "等待输入"},
+        "stopped": {"icon": "🛑", "template": "red", "text": "终端已停止"},
+        "error": {"icon": "❌", "template": "red", "text": "发生错误"},
+    }
+
+    config = status_config.get(status, {"icon": "📌", "template": "blue", "text": status})
+
+    builder = CardBuilder()
+    builder.set_header(f"{config['icon']} {config['text']}", config['template'])
+
+    # 构建内容
+    content_lines = [
+        f"**终端**: `{details.get('terminal_id', 'unknown')}`",
+        f"**主机**: `{details.get('hostname', 'unknown')}`",
+    ]
+
+    if details.get('message'):
+        content_lines.append(f"**状态**: {details['message']}")
+
+    if details.get('session_id'):
+        content_lines.append(f"**会话**: `{details['session_id'][:8]}...`")
+
+    builder.add_div("\n".join(content_lines), "lark_md")
+
+    # 添加时间戳
+    builder.add_note(f"更新时间: {datetime.datetime.now().strftime('%H:%M:%S')}")
+
+    return send_card_message(chat_id, builder.build(), access_token)
 
 
 def send_long_markdown_message(

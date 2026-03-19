@@ -117,3 +117,28 @@ def get_guest_proxy_config() -> dict:
         "port": guest_config.get("port", 8081),
         "host_bridge_url": os.getenv("HOST_BRIDGE_URL") or guest_config.get("host_bridge_url", "http://host.docker.internal:8080"),
     }
+
+
+def get_terminal_session_config() -> dict:
+    """
+    获取 Terminal 会话配置
+
+    Returns:
+        dict: {
+            "enabled": bool,
+            "auto_create_chat": bool,
+            "auto_disband_on_exit": bool,
+            "user_open_id": str,
+            "group_name_prefix": str
+        }
+    """
+    config = load_config()
+    terminal_config = config.get("terminal_session", {})
+
+    return {
+        "enabled": terminal_config.get("enabled", True),
+        "auto_create_chat": terminal_config.get("auto_create_chat", True),
+        "auto_disband_on_exit": terminal_config.get("auto_disband_on_exit", True),
+        "user_open_id": os.getenv("FEISHU_USER_OPEN_ID") or terminal_config.get("user_open_id", ""),
+        "group_name_prefix": terminal_config.get("group_name_prefix", "💻 Terminal"),
+    }

@@ -23,9 +23,9 @@ A Feishu (飞书) bot that integrates Claude Code CLI, enabling users to interac
 - Guest Proxy runs inside Docker containers, inheriting `.bashrc`, venv, and environment
 - Redis stores `chat_id -> container_endpoint` routing
 - Permission confirmation via Feishu messages for sensitive operations (Write, Edit, Bash)
-- Protocol interceptor for management commands (`/ls`, `/start`, `/exit`, `/bind-terminal`)
+- Protocol interceptor for management commands (`/ls`, `/start`, `/exit`)
 - Independent Claude sessions per container
-- **Terminal-Feishu Session Sync**: Terminal CLI can bind to Feishu chat for permission confirmations
+- **Terminal Auto-Create**: Terminal CLI automatically creates Feishu group chat on startup
 
 ## Quick Start
 
@@ -81,38 +81,45 @@ curl http://localhost:8081/health        # Guest Proxy (in container)
 curl http://localhost:8082/health        # Local Session Bridge
 ```
 
-## Terminal-Feishu Session Sync
+## Terminal Auto-Create
 
-Terminal CLI can bind to a Feishu chat for permission confirmations:
+Terminal CLI automatically creates a Feishu group chat on startup for permission confirmations:
 
 ```bash
-# 1. Start the Host Bridge (includes Local Session Bridge)
+# 1. Configure terminal_session in config.yaml
+terminal_session:
+  enabled: true
+  user_open_id: "ou_xxxxxx"  # Your Feishu open_id
+  group_name_prefix: "💻 Terminal"
+
+# 2. Start the Host Bridge (includes Local Session Bridge)
 python -m src.main_websocket
 
-# 2. Register Terminal
-python -m src.terminal_client --register
-# Output: 注册码: ABC123
-#         请在飞书发送: /bind-terminal ABC123
-
-# 3. In Feishu, send the bind command
-/bind-terminal ABC123
-
-# 4. Use Terminal CLI
+# 3. Start Terminal CLI - automatically creates Feishu group chat
 python -m src.terminal_client
-# Messages sent here will trigger permission popups in Feishu
+# Output: ✅ 已绑定群聊: oc_xxxxx...
+# Group chat named "💻 Terminal <hostname>" is created
+
+# 4. On exit, group chat is automatically disbanded
+# Use --keep-chat to preserve the group chat
+python -m src.terminal_client --keep-chat
 ```
 
 **Architecture:**
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│ Terminal CLI    │───►│ Local Bridge    │───►│ Host Bridge     │
-│ (用户输入)       │    │ (:8082)         │    │ (:8080)         │
+│ Terminal CLI    │───►│ Local Bridge    │───►│ Feishu API      │
+│ (启动时)         │    │ (:8082)         │    │ (创建群聊)       │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
-                                                      │
-                                                      ▼
-                                               ┌─────────────────┐
-                                               │ Feishu 权限卡片  │
-                                               └─────────────────┘
+        │                       │
+        │                       ▼
+        │              ┌─────────────────┐
+        │              │ Host Bridge     │
+        │              │ (权限转发)       │
+        │              └─────────────────┘
+        │                       │
+        ▼                       ▼
+   Claude 输出 ──────────► Feishu 权限卡片
 ```
 
 ## Configuration (`config.yaml`)
@@ -126,10 +133,19 @@ authorized_users:
 permission:
   enabled: true    # Require confirmation for sensitive operations
   timeout: 0       # 0 = wait indefinitely
+
+# Terminal session settings (for Terminal CLI auto-create)
+terminal_session:
+  enabled: true              # Enable Terminal auto-create feature
+  auto_create_chat: true     # Auto-create group chat on Terminal startup
+  auto_disband_on_exit: true # Auto-disband group chat on Terminal exit
+  user_open_id: "ou_xxxxxx"  # User open_id for creating group chats
+  group_name_prefix: "💻 Terminal"  # Group chat name prefix
 ```
 
 - Copy `config.example.yaml` to `config.yaml` and configure
 - `authorized_users` is **required** - unauthorized users will be rejected
+- `terminal_session.user_open_id` is **required** for Terminal CLI auto-create
 
 ## Architecture
 
@@ -141,17 +157,18 @@ permission:
 | `src/host_bridge/server.py` | HTTP server for Guest Proxy registration and permission forwarding |
 | `src/local_session_bridge/server.py` | Local Session Bridge for Terminal CLI connections |
 | `src/local_session_bridge/claude_client.py` | Local Claude client with permission forwarding |
-| `src/terminal_client/client.py` | Terminal CLI client for interacting with Local Bridge |
+| `src/terminal_client/client.py` | Terminal CLI client (auto-create Feishu group chat) |
+| `src/terminal_session_manager.py` | Terminal session management (create/disband group chats) |
 | `src/host_bridge/client.py` | HTTP client for communicating with Guest Proxy |
 | `src/guest_proxy/server.py` | HTTP server running inside Docker containers |
 | `src/guest_proxy/claude_client.py` | Claude Code SDK wrapper with permission callbacks |
 | `src/protocol/__init__.py` | JSON-RPC 2.0 protocol definitions (requests, responses, error codes) |
-| `src/interceptor.py` | Protocol interceptor for management commands (`/ls`, `/start`, `/exit`, `/bind-terminal`) |
+| `src/interceptor.py` | Protocol interceptor for management commands (`/ls`, `/start`, `/exit`) |
 | `src/redis_client.py` | Redis client for route management (`chat_id -> endpoint`) |
 | `src/docker_session_manager.py` | Docker session persistence (SQLite) |
 | `src/permission_manager.py` | Permission confirmation state management |
 | `src/config.py` | Configuration loading (YAML + env vars) and user authorization |
-| `src/feishu_utils/feishu_utils.py` | Feishu API utilities (send/reply messages, create group chats) |
+| `src/feishu_utils/feishu_utils.py` | Feishu API utilities (send/reply messages, create/disband group chats) |
 | `src/feishu_utils/card_builder.py` | Card message builder (interactive cards, buttons, status updates) |
 | `src/status_manager.py` | Status message management with card-based in-place updates |
 
@@ -177,10 +194,11 @@ permission:
 |----------|--------|-------------|
 | `/rpc` | POST | JSON-RPC 2.0 requests (chat, health_check) |
 | `/stream` | POST | Streaming chat (NDJSON response) |
-| `/health` | GET | Health check (returns active sessions, pending registers) |
-| `/register` | POST | Generate registration code for Terminal binding |
-| `/bind` | POST | Bind registration code to chat_id |
+| `/health` | GET | Health check (returns active sessions) |
 | `/status` | GET | Detailed status including session list |
+| `/terminal/create` | POST | Create Terminal session (auto-create Feishu group chat) |
+| `/terminal/close` | POST | Close Terminal session (disband group chat) |
+| `/terminal/sync` | POST | Sync output/status to group chat |
 
 ### Request Flow
 
@@ -491,6 +509,7 @@ See `docs/GUEST_PROXY_INTEGRATION.md` for:
 │   ├── redis_client.py        # Redis route management
 │   ├── interceptor.py         # Protocol interceptor for /commands
 │   ├── docker_session_manager.py  # Docker session persistence
+│   ├── terminal_session_manager.py # Terminal session management
 │   ├── permission_manager.py  # Permission confirmation state
 │   ├── status_manager.py      # Status message management
 │   ├── protocol/              # JSON-RPC protocol definitions
@@ -506,12 +525,16 @@ See `docs/GUEST_PROXY_INTEGRATION.md` for:
 │   │   ├── watchdog.py        # Task monitoring
 │   │   ├── status_handler.py  # Status handling
 │   │   └── config.py          # Configuration
+│   ├── terminal_client/       # Terminal CLI
+│   │   ├── __init__.py
+│   │   └── client.py          # Terminal client (auto-create group chat)
 │   └── feishu_utils/          # Feishu API helpers
 │       ├── __init__.py
 │       ├── feishu_utils.py    # Message API functions
 │       └── card_builder.py    # Card message builder
 ├── data/
-│   └── docker_sessions.db     # Docker session mappings (auto-created)
+│   ├── docker_sessions.db     # Docker session mappings (auto-created)
+│   └── terminal_sessions.json # Terminal sessions (auto-created)
 ├── test/
 │   ├── call_claude_code.py    # Claude integration test
 │   ├── test_docker_session.py # Docker session test

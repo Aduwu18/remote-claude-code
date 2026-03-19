@@ -5,21 +5,20 @@ Local Session Bridge HTTP 服务
 1. 提供 HTTP 端点供 Terminal CLI 连接
 2. 创建和管理本地 Claude session
 3. 向 Host Bridge 转发权限请求
+4. Terminal 会话管理（自动创建/解散飞书群聊）
 
 端点：
 - POST /stream - 流式聊天（NDJSON）
 - POST /rpc - JSON-RPC 请求
 - GET /health - 健康检查
-- POST /register - 生成注册码
-- POST /bind - 绑定注册码到 chat_id
+- GET /status - 状态查询
+- POST /terminal/create - 创建 Terminal 会话（自动创建群聊）
+- POST /terminal/close - 关闭 Terminal 会话（解散群聊）
+- POST /terminal/sync - 同步输出/状态到群聊
 """
 import asyncio
 import json
 import logging
-import os
-import random
-import string
-import time
 from typing import Optional
 from aiohttp import web
 
@@ -35,6 +34,7 @@ from src.protocol import (
     StreamEventType,
 )
 from src.local_session_bridge.claude_client import LocalClaudeClient
+from src.terminal_session_manager import TerminalSessionManager, get_terminal_session_manager
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,7 @@ class LocalSessionBridge:
         self,
         port: int = 8082,
         host_bridge_url: str = "http://localhost:8080",
+        terminal_session_manager: TerminalSessionManager = None,
     ):
         """
         初始化服务
@@ -57,6 +58,7 @@ class LocalSessionBridge:
         Args:
             port: 监听端口
             host_bridge_url: Host Bridge URL（用于权限请求）
+            terminal_session_manager: Terminal 会话管理器（可选）
         """
         self.port = port
         self.host_bridge_url = host_bridge_url
@@ -68,20 +70,26 @@ class LocalSessionBridge:
         # 会话缓存：chat_id -> (session_id, client)
         self._sessions: dict[str, tuple[str, LocalClaudeClient]] = {}
 
-        # 待处理的注册：code -> {chat_id, created_at, session_id}
-        self._pending_registers: dict[str, dict] = {}
-        self._register_lock = asyncio.Lock()
+        # Terminal 会话管理器
+        self._terminal_manager = terminal_session_manager
 
     async def start(self):
         """启动服务"""
+        # 初始化 Terminal 会话管理器
+        if self._terminal_manager is None:
+            self._terminal_manager = get_terminal_session_manager()
+
         # 创建 aiohttp 应用 (10MB max body size for long messages)
         self._app = web.Application(client_max_size=10 * 1024 * 1024)
         self._app.router.add_post("/rpc", self._handle_rpc)
         self._app.router.add_post("/stream", self._handle_stream)
         self._app.router.add_get("/health", self._handle_health)
-        self._app.router.add_post("/register", self._handle_register)
-        self._app.router.add_post("/bind", self._handle_bind)
         self._app.router.add_get("/status", self._handle_status)
+
+        # Terminal 会话管理端点
+        self._app.router.add_post("/terminal/create", self._handle_terminal_create)
+        self._app.router.add_post("/terminal/close", self._handle_terminal_close)
+        self._app.router.add_post("/terminal/sync", self._handle_terminal_sync)
 
         # 启动服务
         self._runner = web.AppRunner(self._app)
@@ -115,7 +123,6 @@ class LocalSessionBridge:
         return web.json_response({
             "status": "healthy",
             "active_sessions": len(self._sessions),
-            "pending_registers": len(self._pending_registers),
         })
 
     async def _handle_status(self, request: web.Request) -> web.Response:
@@ -123,7 +130,6 @@ class LocalSessionBridge:
         return web.json_response({
             "status": "healthy",
             "active_sessions": len(self._sessions),
-            "pending_registers": len(self._pending_registers),
             "sessions": [
                 {
                     "chat_id": chat_id[:8] + "...",
@@ -133,119 +139,8 @@ class LocalSessionBridge:
             ],
         })
 
-    async def _handle_register(self, request: web.Request) -> web.Response:
-        """
-        生成注册码
-
-        Terminal CLI 调用此端点获取注册码，然后在 Feishu 发送 /bind-terminal <code> 完成绑定
-        """
-        try:
-            body = await request.json()
-            session_id = body.get("session_id")
-
-            # 生成 6 位注册码
-            code = await self._generate_register_code(session_id)
-
-            logger.info(f"生成注册码: {code}")
-
-            return web.json_response({
-                "success": True,
-                "code": code,
-                "message": f"请在飞书发送: /bind-terminal {code}",
-                "expires_in": 300,  # 5 分钟有效
-            })
-
-        except Exception as e:
-            logger.error(f"生成注册码失败: {e}")
-            return web.json_response({"success": False, "error": str(e)}, status=500)
-
-    async def _handle_bind(self, request: web.Request) -> web.Response:
-        """
-        绑定注册码到 chat_id
-
-        由 Host Bridge 调用（通过 interceptor）
-        """
-        try:
-            body = await request.json()
-            code = body.get("code")
-            chat_id = body.get("chat_id")
-
-            if not code or not chat_id:
-                return web.json_response({"success": False, "error": "Missing code or chat_id"}, status=400)
-
-            # 验证并绑定
-            success = await self._bind_register_code(code, chat_id)
-
-            if success:
-                return web.json_response({"success": True})
-            else:
-                return web.json_response({"success": False, "error": "Invalid or expired code"}, status=400)
-
-        except Exception as e:
-            logger.error(f"绑定注册码失败: {e}")
-            return web.json_response({"success": False, "error": str(e)}, status=500)
-
-    async def _generate_register_code(self, session_id: str = None) -> str:
-        """
-        生成 6 位注册码
-
-        Args:
-            session_id: 可选的会话 ID
-
-        Returns:
-            注册码
-        """
-        async with self._register_lock:
-            # 生成唯一注册码
-            while True:
-                code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-                if code not in self._pending_registers:
-                    break
-
-            self._pending_registers[code] = {
-                "created_at": time.time(),
-                "session_id": session_id,
-            }
-
-            return code
-
-    async def _bind_register_code(self, code: str, chat_id: str) -> bool:
-        """
-        绑定注册码到 chat_id
-
-        Args:
-            code: 注册码
-            chat_id: 飞书聊天 ID
-
-        Returns:
-            是否绑定成功
-        """
-        async with self._register_lock:
-            if code not in self._pending_registers:
-                return False
-
-            # 检查有效期（5 分钟）
-            register_info = self._pending_registers[code]
-            if time.time() - register_info["created_at"] > 300:
-                del self._pending_registers[code]
-                return False
-
-            # 绑定 chat_id
-            register_info["chat_id"] = chat_id
-            logger.info(f"注册码 {code} 已绑定到 chat_id: {chat_id[:8]}...")
-
-            return True
-
     async def _handle_rpc(self, request: web.Request) -> web.Response:
-        """
-        处理 JSON-RPC 请求
-
-        Args:
-            request: HTTP 请求
-
-        Returns:
-            JSON-RPC 响应
-        """
+        """处理 JSON-RPC 请求"""
         try:
             body = await request.json()
             rpc_request = JsonRpcRequest.from_dict(body)
@@ -282,11 +177,7 @@ class LocalSessionBridge:
             )
 
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
-        """
-        处理流式聊天请求
-
-        使用 NDJSON (Newline-Delimited JSON) 格式返回流式响应
-        """
+        """处理流式聊天请求（NDJSON 格式）"""
         # 创建流式响应
         response = web.StreamResponse()
         response.content_type = 'application/x-ndjson'
@@ -305,14 +196,10 @@ class LocalSessionBridge:
             chat_id = chat_params.chat_id
             session_id = chat_params.session_id
 
-            # 检查是否已绑定
             if not chat_id:
-                # 尝试查找已绑定的 chat_id
-                chat_id = await self._find_bound_chat_id()
-                if not chat_id:
-                    event = StreamEvent.error("未绑定聊天，请先运行 --register")
-                    await response.write(event.to_json().encode() + b'\n')
-                    return response
+                event = StreamEvent.error("缺少 chat_id")
+                await response.write(event.to_json().encode() + b'\n')
+                return response
 
             logger.info(f"流式聊天: chat={chat_id[:8]}..., session={session_id[:8] if session_id else 'None'}...")
 
@@ -436,16 +323,7 @@ class LocalSessionBridge:
         chat_id: str,
         session_id: str = None
     ) -> LocalClaudeClient:
-        """
-        获取或创建 Claude 客户端
-
-        Args:
-            chat_id: 聊天 ID
-            session_id: 会话 ID（用于恢复）
-
-        Returns:
-            LocalClaudeClient 实例
-        """
+        """获取或创建 Claude 客户端"""
         # 检查缓存
         if chat_id in self._sessions:
             cached_session_id, client = self._sessions[chat_id]
@@ -463,32 +341,119 @@ class LocalSessionBridge:
         await client.connect()
         return client
 
-    async def _find_bound_chat_id(self) -> Optional[str]:
-        """
-        查找已绑定的 chat_id
+    async def _handle_terminal_create(self, request: web.Request) -> web.Response:
+        """创建 Terminal 会话（自动创建飞书群聊）"""
+        try:
+            body = await request.json()
+            terminal_id = body.get("terminal_id")
+            user_open_id = body.get("user_open_id")
+            session_id = body.get("session_id")
 
-        Returns:
-            绑定的 chat_id 或 None
-        """
-        async with self._register_lock:
-            for code, info in self._pending_registers.items():
-                if "chat_id" in info:
-                    return info["chat_id"]
-        return None
+            if not terminal_id:
+                return web.json_response({
+                    "success": False,
+                    "error": "缺少 terminal_id"
+                }, status=400)
 
-    def get_bound_chat_id(self, code: str) -> Optional[str]:
-        """
-        获取注册码绑定的 chat_id（同步版本）
+            # 创建会话
+            session = await self._terminal_manager.create_session(
+                terminal_id=terminal_id,
+                user_open_id=user_open_id,
+                session_id=session_id,
+            )
 
-        Args:
-            code: 注册码
+            logger.info(f"创建 Terminal 会话: {terminal_id} -> {session.chat_id}")
 
-        Returns:
-            chat_id 或 None
-        """
-        if code in self._pending_registers:
-            return self._pending_registers[code].get("chat_id")
-        return None
+            return web.json_response({
+                "success": True,
+                "terminal_id": terminal_id,
+                "chat_id": session.chat_id,
+                "message": "会话创建成功"
+            })
+
+        except Exception as e:
+            logger.error(f"创建 Terminal 会话失败: {e}")
+            return web.json_response({
+                "success": False,
+                "error": str(e)
+            }, status=500)
+
+    async def _handle_terminal_close(self, request: web.Request) -> web.Response:
+        """关闭 Terminal 会话（解散群聊）"""
+        try:
+            body = await request.json()
+            terminal_id = body.get("terminal_id")
+            disband_chat = body.get("disband_chat", True)
+
+            if not terminal_id:
+                return web.json_response({
+                    "success": False,
+                    "error": "缺少 terminal_id"
+                }, status=400)
+
+            # 关闭会话
+            success = await self._terminal_manager.close_session(
+                terminal_id=terminal_id,
+                disband_chat=disband_chat,
+            )
+
+            if success:
+                logger.info(f"关闭 Terminal 会话: {terminal_id}")
+                return web.json_response({
+                    "success": True,
+                    "message": "会话已关闭"
+                })
+            else:
+                return web.json_response({
+                    "success": False,
+                    "error": "会话不存在"
+                }, status=404)
+
+        except Exception as e:
+            logger.error(f"关闭 Terminal 会话失败: {e}")
+            return web.json_response({
+                "success": False,
+                "error": str(e)
+            }, status=500)
+
+    async def _handle_terminal_sync(self, request: web.Request) -> web.Response:
+        """同步输出/状态到群聊"""
+        try:
+            body = await request.json()
+            terminal_id = body.get("terminal_id")
+            sync_type = body.get("type", "output")
+
+            if not terminal_id:
+                return web.json_response({
+                    "success": False,
+                    "error": "缺少 terminal_id"
+                }, status=400)
+
+            if sync_type == "output":
+                content = body.get("content", "")
+                success = await self._terminal_manager.sync_output(terminal_id, content)
+            elif sync_type == "status":
+                status = body.get("status", "idle")
+                details = body.get("details", {})
+                success = await self._terminal_manager.sync_status(terminal_id, status, details)
+            else:
+                return web.json_response({
+                    "success": False,
+                    "error": f"未知的同步类型: {sync_type}"
+                }, status=400)
+
+            return web.json_response({"success": success})
+
+        except Exception as e:
+            logger.error(f"同步失败: {e}")
+            return web.json_response({
+                "success": False,
+                "error": str(e)
+            }, status=500)
+
+    def get_terminal_chat_id(self, terminal_id: str) -> Optional[str]:
+        """获取 Terminal 的 chat_id"""
+        return self._terminal_manager.get_chat_id(terminal_id)
 
 
 # 全局单例

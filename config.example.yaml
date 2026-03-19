@@ -33,3 +33,18 @@ host_bridge:
 guest_proxy:
   port: 8081
   host_bridge_url: "http://host.docker.internal:8080"
+
+# Terminal 会话配置
+# 用于 Terminal CLI 自动创建飞书群聊
+terminal_session:
+  # 是否启用 Terminal 会话功能
+  enabled: true
+  # 是否自动创建群聊（Terminal CLI 启动时自动创建）
+  auto_create_chat: true
+  # 终端退出时是否自动解散群聊
+  auto_disband_on_exit: true
+  # 默认用户 open_id（用于创建群聊）
+  # 也可以通过环境变量 FEISHU_USER_OPEN_ID 设置
+  user_open_id: "ou_xxxxxx"  # 替换为实际的 open_id
+  # 群聊名称前缀（格式：前缀 主机名）
+  group_name_prefix: "💻 Terminal"
