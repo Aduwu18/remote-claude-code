@@ -321,6 +321,7 @@ class TerminalClaudeClient:
             bridge_url=self.bridge_url,
             chat_id=self._chat_id,
             on_event=self._on_claude_event,
+            raw_pty=True,  # PTY 模式下使用原始模式，外部直接读取
         )
 
         await self._claude.start()
@@ -378,6 +379,9 @@ class TerminalClaudeClient:
 
         将用户终端直接连接到 Claude CLI 进程，提供完全原生的交互体验。
         """
+        import select
+        import threading
+
         print("PTY 模式：直接连接到 Claude CLI...")
         print("按 Ctrl+C 退出")
         print("-" * 60)
@@ -395,6 +399,7 @@ class TerminalClaudeClient:
             return
 
         master_fd = pty_client._master_fd
+        stdin_fd = sys.stdin.fileno()
 
         # 终端大小变化处理
         def handle_sigwinch(signum, frame):
@@ -407,100 +412,69 @@ class TerminalClaudeClient:
 
         old_sigwinch = signal.signal(signal.SIGWINCH, handle_sigwinch)
 
-        # 注册退出处理
-        def signal_handler(signum, frame):
-            raise KeyboardInterrupt()
+        # 运行标志
+        running = True
 
-        old_sigint = signal.signal(signal.SIGINT, signal_handler)
-        old_sigterm = signal.signal(signal.SIGTERM, signal_handler)
+        def pty_relay_loop():
+            """同步 PTY 转发循环（在独立线程运行）"""
+            nonlocal running
 
-        try:
-            # 使用 loop.add_reader 来处理 stdin（raw terminal 模式下更可靠）
-            loop = asyncio.get_event_loop()
-            stdin_fd = sys.stdin.fileno()
-            stdin_queue = asyncio.Queue()
-
-            def stdin_callback():
-                """stdin 可读时的回调"""
+            while running:
                 try:
-                    data = os.read(stdin_fd, 1024)
-                    if data:
-                        # 放入队列，由异步任务处理
-                        stdin_queue.put_nowait(data)
-                except Exception:
-                    pass
+                    # 使用 select 同时监听 stdin 和 master_fd
+                    ready_read, _, _ = select.select([stdin_fd, master_fd], [], [], 0.05)
 
-            # 注册 stdin reader
-            loop.add_reader(stdin_fd, stdin_callback)
-
-            async def forward_stdin_to_pty():
-                """将 stdin 转发到 PTY"""
-                while self._running:
-                    try:
-                        data = await asyncio.wait_for(stdin_queue.get(), timeout=0.1)
-                        os.write(master_fd, data)
-                    except asyncio.TimeoutError:
-                        continue
-                    except Exception:
-                        break
-
-            async def forward_pty_to_stdout():
-                """将 PTY 输出转发到 stdout"""
-                import select
-
-                while self._running:
-                    try:
-                        # 使用 select 检查是否有数据可读
-                        ready, _, _ = select.select([master_fd], [], [], 0.05)
-                        if ready:
+                    for fd in ready_read:
+                        if fd == stdin_fd:
+                            # stdin → PTY
+                            data = os.read(stdin_fd, 1024)
+                            if data:
+                                os.write(master_fd, data)
+                        elif fd == master_fd:
+                            # PTY → stdout
                             data = os.read(master_fd, 4096)
                             if data:
                                 sys.stdout.buffer.write(data)
                                 sys.stdout.buffer.flush()
-                    except Exception:
-                        break
 
-            async def check_feishu_injection():
-                """检查飞书消息注入"""
-                while self._running:
-                    try:
-                        feishu_msg = await asyncio.wait_for(
-                            self._input_queue.get(),
-                            timeout=0.1
-                        )
-                        # 注入到 PTY
-                        os.write(master_fd, feishu_msg.encode() + b"\n")
-                    except asyncio.TimeoutError:
-                        continue
-                    except Exception:
-                        break
+                except OSError:
+                    break
+                except Exception:
+                    break
 
-            # 并行运行所有转发任务
-            await asyncio.gather(
-                forward_stdin_to_pty(),
-                forward_pty_to_stdout(),
-                check_feishu_injection(),
-                return_exceptions=True,
-            )
+        # 启动 PTY 转发线程
+        relay_thread = threading.Thread(target=pty_relay_loop, daemon=True)
+        relay_thread.start()
 
-            # 清理 stdin reader
-            loop.remove_reader(stdin_fd)
+        try:
+            # 主线程等待退出信号或处理飞书消息注入
+            while self._running and relay_thread.is_alive():
+                try:
+                    # 检查飞书消息注入
+                    feishu_msg = await asyncio.wait_for(
+                        self._input_queue.get(),
+                        timeout=0.1
+                    )
+                    # 注入到 PTY
+                    os.write(master_fd, feishu_msg.encode() + b"\n")
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    break
 
         except KeyboardInterrupt:
             pass
         finally:
-            # 清理 stdin reader（确保清理）
-            try:
-                loop.remove_reader(stdin_fd)
-            except Exception:
-                pass
+            running = False
+            self._running = False
+
+            # 等待转发线程结束
+            relay_thread.join(timeout=1.0)
 
             # 恢复终端设置
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
 
             # 恢复信号处理
-            signal.signal(signal.SIGINT, old_sigint)
-            signal.signal(signal.SIGTERM, old_sigterm)
             signal.signal(signal.SIGWINCH, old_sigwinch)
 
             print("\n" + "-" * 60)

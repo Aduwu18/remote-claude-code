@@ -87,6 +87,7 @@ class NativeClaudePTYClient:
         session_id: str = None,
         working_dir: str = None,
         on_output: callable = None,
+        raw_mode: bool = False,  # 原始模式：不启动内部读取任务
     ):
         """
         初始化客户端
@@ -95,10 +96,12 @@ class NativeClaudePTYClient:
             session_id: 恢复的会话 ID
             working_dir: 工作目录
             on_output: 输出回调 (output: str) -> None
+            raw_mode: 原始模式，不启动内部读取任务（用于外部直接读取）
         """
         self.session_id = session_id
         self.working_dir = working_dir or os.getcwd()
         self.on_output = on_output
+        self.raw_mode = raw_mode
 
         self._master_fd = None
         self._slave_fd = None
@@ -167,10 +170,11 @@ class NativeClaudePTYClient:
 
             self._running = True
 
-            # 启动输出读取任务
-            self._output_task = asyncio.create_task(self._read_output())
+            # 仅在非原始模式下启动输出读取任务
+            if not self.raw_mode:
+                self._output_task = asyncio.create_task(self._read_output())
 
-            logger.info(f"Claude CLI 已启动 (PID: {pid})")
+            logger.info(f"Claude CLI 已启动 (PID: {pid}, raw_mode={self.raw_mode})")
 
     async def _read_output(self):
         """读取 PTY 输出"""
@@ -623,6 +627,7 @@ class NativeClaudeClient:
         bridge_url: str = None,  # 用于飞书同步
         chat_id: str = None,
         on_event: Callable[[NativeEvent], None] = None,
+        raw_pty: bool = False,  # PTY 原始模式（外部直接读取）
     ):
         """
         初始化客户端
@@ -635,6 +640,7 @@ class NativeClaudeClient:
             bridge_url: Bridge URL（用于飞书同步）
             chat_id: 飞书群聊 ID
             on_event: 事件回调
+            raw_pty: PTY 原始模式，不启动内部读取任务（用于外部直接读取 PTY）
         """
         self.session_id = session_id
         self.working_dir = working_dir or os.getcwd()
@@ -643,6 +649,7 @@ class NativeClaudeClient:
         self.bridge_url = bridge_url
         self.chat_id = chat_id
         self.on_event = on_event
+        self.raw_pty = raw_pty
 
         # 底层客户端
         self._pty_client: Optional[NativeClaudePTYClient] = None
@@ -670,7 +677,8 @@ class NativeClaudeClient:
             self._pty_client = NativeClaudePTYClient(
                 session_id=self.session_id,
                 working_dir=self.working_dir,
-                on_output=self._handle_pty_output,
+                on_output=self._handle_pty_output if not self.raw_pty else None,
+                raw_mode=self.raw_pty,
             )
             await self._pty_client.start()
         else:
