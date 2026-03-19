@@ -40,6 +40,7 @@ class ProtocolInterceptor:
         on_create_session: Callable[[str, str, str], Awaitable[str]] = None,
         on_delete_session: Callable[[str], Awaitable[bool]] = None,
         is_authorized: Callable[[str], bool] = None,
+        on_bind_terminal: Callable[[str, str], Awaitable[bool]] = None,
     ):
         """
         初始化拦截器
@@ -48,6 +49,7 @@ class ProtocolInterceptor:
             on_create_session: 创建会话的回调 (user_id, container_name, chat_id) -> new_chat_id
             on_delete_session: 删除会话的回调 (chat_id) -> bool
             is_authorized: 检查用户是否授权的回调 (user_id) -> bool
+            on_bind_terminal: 绑定 Terminal 的回调 (code, chat_id) -> bool
         """
         try:
             self.client = docker.from_env()
@@ -59,6 +61,7 @@ class ProtocolInterceptor:
         self.on_create_session = on_create_session
         self.on_delete_session = on_delete_session
         self.is_authorized = is_authorized
+        self.on_bind_terminal = on_bind_terminal
 
         # 注册管理命令与处理函数的映射
         self.handlers = {
@@ -68,6 +71,7 @@ class ProtocolInterceptor:
             "/enter": self._start_session,
             "/stop": self._stop_session,
             "/exit": self._stop_session,
+            "/bind": self._bind_terminal,
             "/help": self._show_help,
             "/?": self._show_help,
         }
@@ -212,6 +216,23 @@ class ProtocolInterceptor:
 
         return "⚠️ 会话管理功能未配置"
 
+    def _bind_terminal(
+        self,
+        user_id: str,
+        chat_id: str,
+        args: list
+    ) -> str:
+        """绑定 Terminal 到当前聊天"""
+        if not args:
+            return "⚠️ 请提供注册码\n用法: /bind <注册码>"
+
+        code = args[0]
+
+        if self.on_bind_terminal:
+            return ("__ASYNC_BIND_TERMINAL__", code, chat_id)
+
+        return "⚠️ Terminal 绑定功能未配置"
+
     def _show_help(
         self,
         user_id: str,
@@ -226,6 +247,7 @@ class ProtocolInterceptor:
 /start <名称> - 进入容器会话
 /enter <名称> - 同上
 /stop, /exit - 退出当前容器会话
+/bind <注册码> - 绑定 Terminal 到当前聊天
 /help, /? - 显示此帮助
 
 **自然语言**（无需前缀）
@@ -252,6 +274,7 @@ def init_interceptor(
     on_create_session: Callable = None,
     on_delete_session: Callable = None,
     is_authorized: Callable = None,
+    on_bind_terminal: Callable = None,
 ) -> ProtocolInterceptor:
     """初始化拦截器"""
     global _interceptor
@@ -259,5 +282,6 @@ def init_interceptor(
         on_create_session=on_create_session,
         on_delete_session=on_delete_session,
         is_authorized=is_authorized,
+        on_bind_terminal=on_bind_terminal,
     )
     return _interceptor

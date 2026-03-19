@@ -414,6 +414,21 @@ class TerminalSessionManager:
         session = self._sessions.get(terminal_id)
         return session.chat_id if session else None
 
+    def get_terminal_id(self, chat_id: str) -> Optional[str]:
+        """
+        通过群聊 ID 获取终端 ID
+
+        Args:
+            chat_id: 群聊 ID
+
+        Returns:
+            terminal_id 或 None
+        """
+        for terminal_id, session in self._sessions.items():
+            if session.chat_id == chat_id:
+                return terminal_id
+        return None
+
     def list_sessions(self) -> list[TerminalSession]:
         """
         列出所有会话

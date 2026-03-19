@@ -81,46 +81,85 @@ curl http://localhost:8081/health        # Guest Proxy (in container)
 curl http://localhost:8082/health        # Local Session Bridge
 ```
 
-## Terminal Auto-Create
+## Terminal CLI Modes
 
-Terminal CLI automatically creates a Feishu group chat on startup for permission confirmations:
+Terminal CLI supports two modes:
+
+### Mode 1: Native CLI Mode (Default, Recommended)
+
+Runs the native `claude` CLI directly with full local experience:
 
 ```bash
-# 1. Configure terminal_session in config.yaml
+# Start Terminal with native CLI
+python -m src.terminal_client
+
+# Specify sync mode
+python -m src.terminal_client --sync-mode notify   # Default: only notifications
+python -m src.terminal_client --sync-mode sync     # Full bidirectional sync
+
+# Specify CLI mode
+python -m src.terminal_client --cli-mode print     # Recommended: each message is a new process
+python -m src.terminal_client --cli-mode pty       # Interactive PTY mode
+```
+
+**Features:**
+- Native CLI experience (PTY or Print mode)
+- Dual-channel permission confirmation (CLI and Feishu)
+- Two sync modes: `notify` (only alerts) or `sync` (full sync)
+- Feishu message injection into CLI
+
+### Mode 2: SDK Mode (Legacy)
+
+Uses Claude SDK through Local Bridge:
+
+```bash
+# Set environment variable to use SDK mode
+export TERMINAL_USE_SDK=true
+python -m src.terminal_client
+```
+
+### Configuration
+
+```yaml
 terminal_session:
   enabled: true
   user_open_id: "ou_xxxxxx"  # Your Feishu open_id
   group_name_prefix: "💻 Terminal"
 
-# 2. Start the Host Bridge (includes Local Session Bridge)
-python -m src.main_websocket
+  # Sync mode configuration
+  sync_mode: "notify"  # "notify" (only alerts) or "sync" (full sync)
 
-# 3. Start Terminal CLI - automatically creates Feishu group chat
-python -m src.terminal_client
-# Output: ✅ 已绑定群聊: oc_xxxxx...
-# Group chat named "💻 Terminal <hostname>" is created
-
-# 4. On exit, group chat is automatically disbanded
-# Use --keep-chat to preserve the group chat
-python -m src.terminal_client --keep-chat
+  # Permission confirmation settings
+  permission:
+    dual_channel: true  # Enable dual-channel confirmation (CLI + Feishu)
+    cli_timeout: 60     # CLI confirmation timeout (seconds)
+    feishu_timeout: 300 # Feishu confirmation timeout (seconds)
 ```
 
-**Architecture:**
+### Native Mode Architecture
+
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│ Terminal CLI    │───►│ Local Bridge    │───►│ Feishu API      │
-│ (启动时)         │    │ (:8082)         │    │ (创建群聊)       │
+│ Terminal CLI    │───►│ Native Client   │───►│ Claude CLI      │
+│ (交互界面)       │    │ (PTY/Print)     │    │ (原生进程)       │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
         │                       │
-        │                       ▼
-        │              ┌─────────────────┐
-        │              │ Host Bridge     │
-        │              │ (权限转发)       │
-        │              └─────────────────┘
-        │                       │
+        │ WebSocket             │ HTTP
         ▼                       ▼
-   Claude 输出 ──────────► Feishu 权限卡片
+┌─────────────────┐    ┌─────────────────┐
+│ Local Bridge    │───►│ Feishu API      │
+│ (:8082/ws)      │    │ (权限/同步)      │
+└─────────────────┘    └─────────────────┘
 ```
+
+### Dual-Channel Permission Confirmation
+
+When Claude requests permission for sensitive operations:
+1. CLI prompts for user input (y/n)
+2. Feishu sends permission card simultaneously
+3. Whichever channel responds first is used
+
+This allows users to confirm permissions from either terminal or mobile.
 
 ## Configuration (`config.yaml`)
 
@@ -157,13 +196,14 @@ terminal_session:
 | `src/host_bridge/server.py` | HTTP server for Guest Proxy registration and permission forwarding |
 | `src/local_session_bridge/server.py` | Local Session Bridge for Terminal CLI connections |
 | `src/local_session_bridge/claude_client.py` | Local Claude client with permission forwarding |
-| `src/terminal_client/client.py` | Terminal CLI client (auto-create Feishu group chat) |
+| `src/terminal_client/client.py` | Terminal CLI client (native mode with Feishu sync) |
+| `src/native_claude_client.py` | Native Claude CLI client (PTY/Print modes, dual-channel permissions) |
 | `src/terminal_session_manager.py` | Terminal session management (create/disband group chats) |
 | `src/host_bridge/client.py` | HTTP client for communicating with Guest Proxy |
 | `src/guest_proxy/server.py` | HTTP server running inside Docker containers |
 | `src/guest_proxy/claude_client.py` | Claude Code SDK wrapper with permission callbacks |
 | `src/protocol/__init__.py` | JSON-RPC 2.0 protocol definitions (requests, responses, error codes) |
-| `src/interceptor.py` | Protocol interceptor for management commands (`/ls`, `/start`, `/exit`) |
+| `src/interceptor.py` | Protocol interceptor for management commands (`/ls`, `/start`, `/exit`, `/bind`) |
 | `src/redis_client.py` | Redis client for route management (`chat_id -> endpoint`) |
 | `src/docker_session_manager.py` | Docker session persistence (SQLite) |
 | `src/permission_manager.py` | Permission confirmation state management |
@@ -196,9 +236,12 @@ terminal_session:
 | `/stream` | POST | Streaming chat (NDJSON response) |
 | `/health` | GET | Health check (returns active sessions) |
 | `/status` | GET | Detailed status including session list |
+| `/ws` | GET | WebSocket connection for bidirectional communication |
 | `/terminal/create` | POST | Create Terminal session (auto-create Feishu group chat) |
 | `/terminal/close` | POST | Close Terminal session (disband group chat) |
 | `/terminal/sync` | POST | Sync output/status to group chat |
+| `/permission/request` | POST | Permission request from native client to Feishu |
+| `/permission/response` | POST | Permission response from Feishu to native client |
 
 ### Request Flow
 
@@ -363,7 +406,7 @@ else:
     endpoint = redis_client.get_route(chat_id)
 ```
 
-**Supported commands:** `/ls`, `/start <name>`, `/enter <name>`, `/stop`, `/exit`, `/help`
+**Supported commands:** `/ls`, `/start <name>`, `/enter <name>`, `/stop`, `/exit`, `/bind <code>`, `/help`
 
 ### 3. Guest Proxy Client (`src/host_bridge/client.py`)
 
@@ -510,6 +553,7 @@ See `docs/GUEST_PROXY_INTEGRATION.md` for:
 │   ├── interceptor.py         # Protocol interceptor for /commands
 │   ├── docker_session_manager.py  # Docker session persistence
 │   ├── terminal_session_manager.py # Terminal session management
+│   ├── native_claude_client.py    # Native Claude CLI client (PTY/Print modes)
 │   ├── permission_manager.py  # Permission confirmation state
 │   ├── status_manager.py      # Status message management
 │   ├── protocol/              # JSON-RPC protocol definitions
@@ -527,7 +571,7 @@ See `docs/GUEST_PROXY_INTEGRATION.md` for:
 │   │   └── config.py          # Configuration
 │   ├── terminal_client/       # Terminal CLI
 │   │   ├── __init__.py
-│   │   └── client.py          # Terminal client (auto-create group chat)
+│   │   └── client.py          # Terminal client (native mode with Feishu sync)
 │   └── feishu_utils/          # Feishu API helpers
 │       ├── __init__.py
 │       ├── feishu_utils.py    # Message API functions

@@ -48,3 +48,12 @@ terminal_session:
   user_open_id: "ou_xxxxxx"  # 替换为实际的 open_id
   # 群聊名称前缀（格式：前缀 主机名）
   group_name_prefix: "💻 Terminal"
+
+  # 同步模式配置
+  sync_mode: "notify"  # "notify" (模式A: 只提醒) 或 "sync" (模式B: 完全同步)
+
+  # 权限确认配置
+  permission:
+    dual_channel: true  # 启用双向权限确认（CLI 和飞书都可以确认）
+    cli_timeout: 60     # CLI 确认超时（秒）
+    feishu_timeout: 300 # 飞书确认超时（秒）

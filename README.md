@@ -41,6 +41,12 @@
 - Guest Proxy 在容器内运行，继承 `.bashrc`、虚拟环境等
 - 每个容器独立的 Claude 会话上下文
 
+**Terminal 原生模式**
+- 直接运行原生 `claude` CLI，获得完整本地体验
+- PTY 模式（交互式）和 Print 模式（推荐）两种选择
+- 双向权限确认：CLI 和飞书都可确认权限
+- 两种同步模式：`notify`（只提醒）和 `sync`（完全同步）
+
 **路由管理**
 - Redis 存储 `chat_id -> container_endpoint` 映射
 - 支持多容器并行操作
@@ -48,6 +54,7 @@
 **权限确认**
 - 敏感操作（Write, Edit, Bash）需要用户确认
 - 卡片消息交互 + 文本回复 "y/n" 双重确认
+- Terminal CLI 支持 CLI 和飞书双向确认
 
 **流式响应**
 - 实时状态更新（卡片原地更新）
@@ -253,6 +260,31 @@ curl http://localhost:8081/health
 
 ---
 
+## Terminal CLI 原生模式
+
+Terminal CLI 支持直接运行原生 `claude` CLI，获得完整的本地体验：
+
+```bash
+# 启动 Terminal（原生模式，默认）
+python -m src.terminal_client
+
+# 指定同步模式
+python -m src.terminal_client --sync-mode notify   # 默认：只提醒交互需求
+python -m src.terminal_client --sync-mode sync     # 完全双向同步
+
+# 指定 CLI 模式
+python -m src.terminal_client --cli-mode print     # 推荐：每条消息独立进程
+python -m src.terminal_client --cli-mode pty       # 交互式 PTY 模式
+```
+
+**特性：**
+- 原生 CLI 体验（PTY 或 Print 模式）
+- 双向权限确认（CLI 和飞书都可以确认权限）
+- 两种同步模式（只提醒/完全同步）
+- 飞书消息自动注入到 CLI
+
+---
+
 ## 飞书应用配置
 
 1. 进入 [飞书开放平台](https://open.feishu.cn/)
@@ -286,6 +318,7 @@ src/
 ├── redis_client.py            # Redis 路由管理
 ├── interceptor.py             # 协议拦截器（管理命令）
 ├── docker_session_manager.py  # Docker 会话持久化
+├── native_claude_client.py    # 原生 Claude CLI 客户端（PTY/Print 模式）
 ├── permission_manager.py      # 权限确认状态管理
 ├── status_manager.py          # 状态消息管理（卡片更新）
 ├── protocol/                  # JSON-RPC 2.0 协议定义
@@ -301,6 +334,9 @@ src/
 │   ├── status_handler.py      # 状态处理
 │   ├── watchdog.py            # 异常监控
 │   └── config.py              # 配置
+├── terminal_client/           # Terminal CLI 模块
+│   ├── __init__.py
+│   └── client.py              # Terminal 客户端（原生模式 + 飞书同步）
 └── feishu_utils/              # 飞书工具
     ├── __init__.py
     ├── feishu_utils.py        # 消息 API
@@ -341,6 +377,19 @@ docs/
 | `/stream` | POST | 流式聊天（NDJSON 响应） |
 | `/health` | GET | 健康检查（返回容器名、活跃会话数） |
 
+### Local Session Bridge (`:8082`)
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/rpc` | POST | JSON-RPC 请求 |
+| `/stream` | POST | 流式聊天（NDJSON 响应） |
+| `/health` | GET | 健康检查 |
+| `/ws` | GET | WebSocket 连接（双向通信） |
+| `/terminal/create` | POST | 创建 Terminal 会话 |
+| `/terminal/close` | POST | 关闭 Terminal 会话 |
+| `/permission/request` | POST | 权限请求（从原生客户端发来） |
+| `/permission/response` | POST | 权限响应（从飞书发来） |
+
 ---
 
 ## 管理命令
@@ -351,6 +400,7 @@ docs/
 | `/start <名称>` | 进入容器会话 | 进入 xxx 容器 |
 | `/enter <名称>` | 进入容器会话 | 进入 xxx |
 | `/exit` | 退出容器会话 | 退出 / 退出容器 |
+| `/bind <注册码>` | 绑定 Terminal 到当前聊天 | - |
 | `/help` | 显示帮助 | - |
 
 ---

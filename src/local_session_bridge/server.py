@@ -6,6 +6,7 @@ Local Session Bridge HTTP 服务
 2. 创建和管理本地 Claude session
 3. 向 Host Bridge 转发权限请求
 4. Terminal 会话管理（自动创建/解散飞书群聊）
+5. WebSocket 支持双向通信（飞书消息注入）
 
 端点：
 - POST /stream - 流式聊天（NDJSON）
@@ -15,6 +16,7 @@ Local Session Bridge HTTP 服务
 - POST /terminal/create - 创建 Terminal 会话（自动创建群聊）
 - POST /terminal/close - 关闭 Terminal 会话（解散群聊）
 - POST /terminal/sync - 同步输出/状态到群聊
+- GET /ws - WebSocket 连接（双向通信）
 """
 import asyncio
 import json
@@ -73,6 +75,9 @@ class LocalSessionBridge:
         # Terminal 会话管理器
         self._terminal_manager = terminal_session_manager
 
+        # WebSocket 客户端：terminal_id -> WebSocketResponse
+        self._ws_clients: dict[str, web.WebSocketResponse] = {}
+
     async def start(self):
         """启动服务"""
         # 初始化 Terminal 会话管理器
@@ -86,10 +91,17 @@ class LocalSessionBridge:
         self._app.router.add_get("/health", self._handle_health)
         self._app.router.add_get("/status", self._handle_status)
 
+        # WebSocket 端点（双向通信）
+        self._app.router.add_get("/ws", self._handle_websocket)
+
         # Terminal 会话管理端点
         self._app.router.add_post("/terminal/create", self._handle_terminal_create)
         self._app.router.add_post("/terminal/close", self._handle_terminal_close)
         self._app.router.add_post("/terminal/sync", self._handle_terminal_sync)
+
+        # 权限请求端点（从飞书接收权限响应）
+        self._app.router.add_post("/permission/request", self._handle_permission_request)
+        self._app.router.add_post("/permission/response", self._handle_permission_response)
 
         # 启动服务
         self._runner = web.AppRunner(self._app)
@@ -446,6 +458,158 @@ class LocalSessionBridge:
 
         except Exception as e:
             logger.error(f"同步失败: {e}")
+            return web.json_response({
+                "success": False,
+                "error": str(e)
+            }, status=500)
+
+    async def _handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
+        """处理 WebSocket 连接"""
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+
+        terminal_id = None
+
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    try:
+                        data = msg.json()
+                        msg_type = data.get("type")
+
+                        if msg_type == "register":
+                            # 注册终端
+                            terminal_id = data.get("terminal_id")
+                            if terminal_id:
+                                self._ws_clients[terminal_id] = ws
+                                logger.info(f"WebSocket 注册: {terminal_id}")
+                                await ws.send_json({"type": "registered", "terminal_id": terminal_id})
+
+                        elif msg_type == "message":
+                            # 来自飞书的消息（注入到 CLI）
+                            # 此处可以记录日志或转发
+                            pass
+
+                    except json.JSONDecodeError:
+                        logger.warning(f"WebSocket 消息解析失败: {msg.data}")
+
+                elif msg.type == web.WSMsgType.ERROR:
+                    logger.error(f"WebSocket 错误: {ws.exception()}")
+                    break
+
+        finally:
+            # 清理连接
+            if terminal_id and terminal_id in self._ws_clients:
+                self._ws_clients.pop(terminal_id, None)
+                logger.info(f"WebSocket 断开: {terminal_id}")
+
+        return ws
+
+    async def inject_message(self, terminal_id: str, message: str) -> bool:
+        """
+        从飞书注入消息到 Terminal CLI
+
+        Args:
+            terminal_id: 终端 ID
+            message: 消息内容
+
+        Returns:
+            是否成功注入
+        """
+        ws = self._ws_clients.get(terminal_id)
+        if ws and not ws.closed:
+            try:
+                await ws.send_json({
+                    "type": "feishu_message",
+                    "content": message,
+                })
+                logger.info(f"消息已注入到终端 {terminal_id}")
+                return True
+            except Exception as e:
+                logger.error(f"注入消息失败: {e}")
+                return False
+        return False
+
+    async def inject_permission_response(self, terminal_id: str, approved: bool) -> bool:
+        """
+        注入权限确认响应到 Terminal CLI
+
+        Args:
+            terminal_id: 终端 ID
+            approved: 是否批准
+
+        Returns:
+            是否成功注入
+        """
+        ws = self._ws_clients.get(terminal_id)
+        if ws and not ws.closed:
+            try:
+                await ws.send_json({
+                    "type": "permission_response",
+                    "approved": approved,
+                })
+                logger.info(f"权限响应已注入到终端 {terminal_id}: approved={approved}")
+                return True
+            except Exception as e:
+                logger.error(f"注入权限响应失败: {e}")
+                return False
+        return False
+
+    async def _handle_permission_request(self, request: web.Request) -> web.Response:
+        """处理权限请求（从 NativeClaudeClient 发来）"""
+        try:
+            body = await request.json()
+            chat_id = body.get("chat_id")
+            tool_name = body.get("tool_name")
+            tool_input = body.get("tool_input", {})
+
+            if not chat_id or not tool_name:
+                return web.json_response({
+                    "success": False,
+                    "error": "缺少 chat_id 或 tool_name"
+                }, status=400)
+
+            # 获取 terminal_id
+            terminal_id = self._terminal_manager.get_terminal_id(chat_id)
+            if terminal_id:
+                # 发送权限请求到 WebSocket 客户端
+                ws = self._ws_clients.get(terminal_id)
+                if ws and not ws.closed:
+                    await ws.send_json({
+                        "type": "permission_request",
+                        "tool_name": tool_name,
+                        "tool_input": tool_input,
+                    })
+
+            return web.json_response({"success": True})
+
+        except Exception as e:
+            logger.error(f"处理权限请求失败: {e}")
+            return web.json_response({
+                "success": False,
+                "error": str(e)
+            }, status=500)
+
+    async def _handle_permission_response(self, request: web.Request) -> web.Response:
+        """处理权限响应（从飞书或外部发来）"""
+        try:
+            body = await request.json()
+            terminal_id = body.get("terminal_id")
+            approved = body.get("approved", False)
+
+            if not terminal_id:
+                return web.json_response({
+                    "success": False,
+                    "error": "缺少 terminal_id"
+                }, status=400)
+
+            # 注入权限响应到 CLI
+            success = await self.inject_permission_response(terminal_id, approved)
+
+            return web.json_response({"success": success})
+
+        except Exception as e:
+            logger.error(f"处理权限响应失败: {e}")
             return web.json_response({
                 "success": False,
                 "error": str(e)
