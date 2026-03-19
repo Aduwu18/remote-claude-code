@@ -43,9 +43,11 @@
 
 **Terminal 原生模式**
 - 直接运行原生 `claude` CLI，获得完整本地体验
-- PTY 模式（交互式）和 Print 模式（推荐）两种选择
+- PTY 模式提供真正的交互式终端体验
 - 双向权限确认：CLI 和飞书都可确认权限
-- 两种同步模式：`notify`（只提醒）和 `sync`（完全同步）
+- 两种同步模式：
+  - `notify`：仅同步权限请求和状态更新
+  - `sync`：完全同步所有输出
 
 **路由管理**
 - Redis 存储 `chat_id -> container_endpoint` 映射
@@ -265,23 +267,48 @@ curl http://localhost:8081/health
 Terminal CLI 支持直接运行原生 `claude` CLI，获得完整的本地体验：
 
 ```bash
-# 启动 Terminal（原生模式，默认）
+# 启动 Terminal（自动创建飞书群聊）
 python -m src.terminal_client
 
 # 指定同步模式
-python -m src.terminal_client --sync-mode notify   # 默认：只提醒交互需求
-python -m src.terminal_client --sync-mode sync     # 完全双向同步
+python -m src.terminal_client --sync-mode notify   # 默认：仅同步权限/状态
+python -m src.terminal_client --sync-mode sync     # 完全同步所有输出
 
-# 指定 CLI 模式
-python -m src.terminal_client --cli-mode print     # 推荐：每条消息独立进程
-python -m src.terminal_client --cli-mode pty       # 交互式 PTY 模式
+# 恢复会话
+python -m src.terminal_client --session <session_id>
+
+# 保持群聊不退出
+python -m src.terminal_client --keep-chat
 ```
 
+**同步模式说明：**
+
+| 模式 | 说明 | 适用场景 |
+|------|------|----------|
+| `notify` | 仅同步权限请求和状态更新 | 日常使用，减少打扰 |
+| `sync` | 同步所有输出到飞书 | 远程监控、协作场景 |
+
 **特性：**
-- 原生 CLI 体验（PTY 或 Print 模式）
+- PTY 模式提供真正的交互式终端体验
 - 双向权限确认（CLI 和飞书都可以确认权限）
-- 两种同步模式（只提醒/完全同步）
 - 飞书消息自动注入到 CLI
+- 实时状态同步（Reading/Writing/Editing/Running 等）
+
+**架构：**
+
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│ Terminal CLI    │───►│ Native Client   │───►│ Claude CLI      │
+│ (交互界面)       │    │ (PTY)           │    │ (原生进程)       │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+        │                       │
+        │ WebSocket             │ HTTP
+        ▼                       ▼
+┌─────────────────┐    ┌─────────────────┐
+│ Local Bridge    │───►│ Feishu API      │
+│ (:8082/ws)      │    │ (权限/同步)      │
+└─────────────────┘    └─────────────────┘
+```
 
 ---
 

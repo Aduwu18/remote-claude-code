@@ -207,6 +207,7 @@ class LocalSessionBridge:
             chat_params = ChatParams.from_dict(rpc_request.params)
             chat_id = chat_params.chat_id
             session_id = chat_params.session_id
+            message = chat_params.message
 
             if not chat_id:
                 event = StreamEvent.error("缺少 chat_id")
@@ -214,6 +215,25 @@ class LocalSessionBridge:
                 return response
 
             logger.info(f"流式聊天: chat={chat_id[:8]}..., session={session_id[:8] if session_id else 'None'}...")
+
+            # 检查是否为 Terminal PTY 会话
+            terminal_id = self._terminal_manager.get_terminal_id(chat_id) if self._terminal_manager else None
+            if terminal_id and terminal_id in self._ws_clients:
+                # Terminal PTY 模式：注入消息到 WebSocket，由 Terminal CLI 处理
+                ws = self._ws_clients[terminal_id]
+                if not ws.closed:
+                    logger.info(f"Terminal PTY 模式：注入消息到 {terminal_id}")
+                    await ws.send_json({
+                        "type": "feishu_message",
+                        "content": message,
+                    })
+                    # 返回成功响应
+                    event = StreamEvent(StreamEventType.COMPLETE, {
+                        "content": "消息已注入到终端 CLI",
+                        "status": "completed",
+                    })
+                    await response.write(event.to_json().encode() + b'\n')
+                    return response
 
             # 心跳任务
             heartbeat_interval = 5

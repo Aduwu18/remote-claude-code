@@ -59,12 +59,11 @@ from src.redis_client import init_redis, redis_client
 from src.host_bridge import start_host_bridge, GuestProxyClient
 from src.host_bridge.server import HostBridgeServer
 from src.local_session_bridge import LocalSessionBridge
-from src.local_session_bridge.claude_client import LocalClaudeClient
 from src.feishu_utils.feishu_utils import send_message, create_group_chat, send_card_message, send_markdown_message
 from src.permission_manager import format_permission_message, build_permission_card_json
 from src.docker_session_manager import docker_session_manager
 from src.status_manager import StatusManager
-from src.protocol import PermissionParams, StreamEventType
+from src.protocol import PermissionParams
 from src.interceptor import init_interceptor, get_interceptor
 
 APP_ID = os.getenv("APP_ID")
@@ -81,10 +80,6 @@ _queue_lock = threading.Lock()
 _pending_permission_chats: set[str] = set()
 _pending_permission_lock = threading.Lock()
 _pending_permission_futures: dict[str, asyncio.Future] = {}
-
-# 本地 Claude 会话缓存: chat_id -> (session_id, LocalClaudeClient)
-_local_sessions: dict[str, tuple[str, LocalClaudeClient]] = {}
-_local_sessions_lock = threading.Lock()
 
 # 全局 Host Bridge 服务
 _host_bridge: Optional[HostBridgeServer] = None
@@ -503,89 +498,77 @@ async def handle_status_update(params):
     send_markdown_message(chat_id, status_msg)
 
 
-def _get_or_create_local_client(chat_id: str) -> LocalClaudeClient:
-    """
-    获取或创建本地 Claude 客户端（带缓存）
-
-    Args:
-        chat_id: 飞书聊天 ID
-
-    Returns:
-        LocalClaudeClient: 本地 Claude 客户端
-    """
-    with _local_sessions_lock:
-        if chat_id in _local_sessions:
-            session_id, client = _local_sessions[chat_id]
-            logger.info(f"复用已有会话: {chat_id[:8]}... -> {session_id[:8] if session_id else 'new'}")
-            return client
-
-        # 创建新客户端
-        bridge_config = get_host_bridge_config()
-        client = LocalClaudeClient(
-            chat_id=chat_id,
-            session_id=None,
-            host_bridge_url=f"http://localhost:{bridge_config['port']}",
-        )
-
-        # 同步连接（在新事件循环中）
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(client.connect())
-            _local_sessions[chat_id] = (client.session_id or "", client)
-            logger.info(f"创建新会话: {chat_id[:8]}...")
-        finally:
-            loop.close()
-
-        return client
-
-
 def chat_with_local_claude(chat_id: str, message: str, user_open_id: str = None) -> str:
     """
-    使用本地 Claude 处理消息（流式响应）
+    使用本地 Claude 处理消息（通过 Local Session Bridge）
 
     流程：
-    1. 获取或创建 LocalClaudeClient
-    2. 流式处理消息
-    3. 实时更新状态卡片
-    4. 返回结果
+    1. 通过 HTTP 调用 Local Session Bridge 的流式 API
+    2. 实时更新状态卡片
+    3. 返回结果
     """
-    status_mgr = StatusManager(chat_id, min_update_interval=5.0)  # 5秒更新间隔
+    status_mgr = StatusManager(chat_id, min_update_interval=5.0)
     status_mgr.send_status("⏳ 正在处理您的请求...")
 
     try:
-        # 获取客户端
-        client = _get_or_create_local_client(chat_id)
-
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             async def _send():
-                response_text = []
-                async for event in client.chat_stream(message):
-                    if event.event_type == StreamEventType.STATUS:
-                        status_text = event.data.get("text", "")
-                        details = event.data.get("details")
-                        if details:
-                            status_text = f"{status_text}: {details}"
-                        status_mgr.update_status(status_text)
-                    elif event.event_type == StreamEventType.CONTENT:
-                        response_text.append(event.data.get("text", ""))
-                    elif event.event_type == StreamEventType.TOOL_CALL:
-                        tool_name = event.data.get("name", "unknown")
-                        status_mgr.update_status(f"🔧 执行工具: {tool_name}")
-                    elif event.event_type == StreamEventType.COMPLETE:
-                        session_id = event.data.get("session_id", "")
-                        content = event.data.get("content", "")
-                        # 更新缓存中的 session_id
-                        with _local_sessions_lock:
-                            if chat_id in _local_sessions:
-                                _local_sessions[chat_id] = (session_id, client)
-                        return content or "\n".join(response_text)
-                    elif event.event_type == StreamEventType.ERROR:
-                        error_msg = event.data.get("message", "未知错误")
-                        raise Exception(error_msg)
-                return "\n".join(response_text)
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    # 构建请求
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "method": "chat_stream",
+                        "params": {
+                            "message": message,
+                            "chat_id": chat_id,
+                            "user_open_id": user_open_id or "",
+                        },
+                        "id": "feishu-request",
+                    }
+
+                    response_text = []
+                    async with session.post(
+                        "http://localhost:8082/stream",
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=300)
+                    ) as resp:
+                        if resp.status != 200:
+                            error_text = await resp.text()
+                            raise Exception(f"Local Bridge 错误: {resp.status} - {error_text}")
+
+                        # 解析 NDJSON 流
+                        async for line in resp.content:
+                            if not line:
+                                continue
+                            try:
+                                event_data = json.loads(line)
+                                event_type = event_data.get("event_type")
+                                data = event_data.get("data", {})
+
+                                if event_type == "status":
+                                    status_text = data.get("text", "")
+                                    details = data.get("details")
+                                    if details:
+                                        status_text = f"{status_text}: {details}"
+                                    status_mgr.update_status(status_text)
+                                elif event_type == "content":
+                                    response_text.append(data.get("text", ""))
+                                elif event_type == "tool_call":
+                                    tool_name = data.get("name", "unknown")
+                                    status_mgr.update_status(f"🔧 执行工具: {tool_name}")
+                                elif event_type == "complete":
+                                    content = data.get("content", "")
+                                    return content or "\n".join(response_text)
+                                elif event_type == "error":
+                                    error_msg = data.get("message", "未知错误")
+                                    raise Exception(error_msg)
+                            except json.JSONDecodeError:
+                                continue
+
+                    return "\n".join(response_text)
 
             reply = loop.run_until_complete(_send())
             status_mgr.finalize(reply)
