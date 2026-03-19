@@ -415,31 +415,42 @@ class TerminalClaudeClient:
         old_sigterm = signal.signal(signal.SIGTERM, signal_handler)
 
         try:
-            # 创建 stdin → PTY 和 PTY → stdout 的转发任务
+            # 使用 loop.add_reader 来处理 stdin（raw terminal 模式下更可靠）
+            loop = asyncio.get_event_loop()
+            stdin_fd = sys.stdin.fileno()
+            stdin_queue = asyncio.Queue()
+
+            def stdin_callback():
+                """stdin 可读时的回调"""
+                try:
+                    data = os.read(stdin_fd, 1024)
+                    if data:
+                        # 放入队列，由异步任务处理
+                        stdin_queue.put_nowait(data)
+                except Exception:
+                    pass
+
+            # 注册 stdin reader
+            loop.add_reader(stdin_fd, stdin_callback)
+
             async def forward_stdin_to_pty():
                 """将 stdin 转发到 PTY"""
-                loop = asyncio.get_event_loop()
-                reader = asyncio.StreamReader()
-                protocol = asyncio.StreamReaderProtocol(reader)
-                await loop.connect_read_pipe(lambda: protocol, sys.stdin)
-
                 while self._running:
                     try:
-                        data = await reader.read(1024)
-                        if not data:
-                            break
+                        data = await asyncio.wait_for(stdin_queue.get(), timeout=0.1)
                         os.write(master_fd, data)
+                    except asyncio.TimeoutError:
+                        continue
                     except Exception:
                         break
 
             async def forward_pty_to_stdout():
                 """将 PTY 输出转发到 stdout"""
-                loop = asyncio.get_event_loop()
+                import select
 
                 while self._running:
                     try:
                         # 使用 select 检查是否有数据可读
-                        import select
                         ready, _, _ = select.select([master_fd], [], [], 0.05)
                         if ready:
                             data = os.read(master_fd, 4096)
@@ -472,9 +483,18 @@ class TerminalClaudeClient:
                 return_exceptions=True,
             )
 
+            # 清理 stdin reader
+            loop.remove_reader(stdin_fd)
+
         except KeyboardInterrupt:
             pass
         finally:
+            # 清理 stdin reader（确保清理）
+            try:
+                loop.remove_reader(stdin_fd)
+            except Exception:
+                pass
+
             # 恢复终端设置
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
 
