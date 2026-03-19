@@ -10,10 +10,15 @@
 - 飞书同步（提醒模式/同步模式）
 """
 import asyncio
+import fcntl
 import json
 import logging
 import os
+import pty
 import re
+import signal
+import struct
+import termios
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import AsyncGenerator, Callable, Optional
