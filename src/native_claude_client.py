@@ -111,8 +111,15 @@ class NativeClaudePTYClient:
         # 创建 PTY
         self._master_fd, self._slave_fd = pty.openpty()
 
+        # 获取当前终端大小
+        try:
+            import shutil
+            cols, rows = shutil.get_terminal_size()
+        except Exception:
+            cols, rows = 80, 24
+
         # 设置终端大小
-        winsize = struct.pack('HHHH', 24, 80, 0, 0)
+        winsize = struct.pack('HHHH', rows, cols, 0, 0)
         fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, winsize)
 
         # Fork 子进程

@@ -31,7 +31,9 @@ import os
 import signal
 import socket
 import sys
+import termios
 import time
+import tty
 from typing import Optional
 
 import aiohttp
@@ -309,9 +311,6 @@ class TerminalClaudeClient:
             print(f"会话: {self.session_id[:8]}...")
 
         print()
-        print("输入消息后按 Enter 发送，输入 /exit 退出")
-        print("飞书消息会自动注入到 CLI（同步模式下）")
-        print("-" * 60)
 
         # 初始化原生客户端
         self._claude = NativeClaudeClient(
@@ -338,64 +337,13 @@ class TerminalClaudeClient:
         self._running = True
         self._ws_task = asyncio.create_task(self._connect_websocket())
 
-        # 注册退出处理
-        def signal_handler(signum, frame):
-            print("\n\n正在退出...")
-            raise KeyboardInterrupt()
-
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-
         try:
-            while self._running:
-                try:
-                    # 优先检查飞书注入的消息
-                    try:
-                        feishu_msg = self._input_queue.get_nowait()
-                        message = feishu_msg
-                        print(f"\n[飞书] {message}")
-                    except asyncio.QueueEmpty:
-                        # 没有飞书消息，等待 CLI 输入
-                        message = input("\n你: ").strip()
-
-                    if not message:
-                        continue
-
-                    if message.lower() in ["/exit", "/quit", "exit", "quit"]:
-                        break
-
-                    print("\nClaude: ", end="", flush=True)
-
-                    # 发送消息（流式处理）
-                    async for event in self._claude.chat_stream(message):
-                        if event.event_type == NativeEventType.CONTENT:
-                            # 内容片段
-                            print(event.data.get("text", ""), end="", flush=True)
-                        elif event.event_type == NativeEventType.TOOL_CALL:
-                            # 工具调用
-                            tool_name = event.data.get("name", "")
-                            print(f"\n[工具: {tool_name}]", flush=True)
-                        elif event.event_type == NativeEventType.PERMISSION_REQUEST:
-                            # 权限请求
-                            tool_name = event.data.get("tool_name", "")
-                            print(f"\n[权限请求] {tool_name} - 等待确认...", flush=True)
-                        elif event.event_type == NativeEventType.COMPLETE:
-                            # 完成
-                            new_session_id = event.data.get("session_id", "")
-                            if new_session_id:
-                                self.session_id = new_session_id
-                            cost = event.data.get("cost", 0)
-                            if cost:
-                                print(f"\n[Session: {self.session_id[:8] if self.session_id else 'N/A'}...] [Cost: ${cost:.4f}]")
-                        elif event.event_type == NativeEventType.ERROR:
-                            print(f"\n[错误] {event.data.get('message', '')}")
-
-                    print()  # 换行
-
-                except KeyboardInterrupt:
-                    break
-                except EOFError:
-                    break
+            if self.cli_mode == "pty":
+                # PTY 模式：直接终端透传
+                await self._run_pty_mode()
+            else:
+                # Print 模式：使用 input 循环
+                await self._run_print_mode()
 
         finally:
             self._running = False
@@ -423,6 +371,187 @@ class TerminalClaudeClient:
             # 关闭飞书会话
             await self._close_feishu_session()
             print("再见！")
+
+    async def _run_pty_mode(self):
+        """
+        PTY 模式：直接终端透传
+
+        将用户终端直接连接到 Claude CLI 进程，提供完全原生的交互体验。
+        """
+        print("PTY 模式：直接连接到 Claude CLI...")
+        print("按 Ctrl+C 退出")
+        print("-" * 60)
+
+        # 保存原始终端设置
+        old_settings = termios.tcgetattr(sys.stdin.fileno())
+
+        # 设置终端为原始模式
+        tty.setraw(sys.stdin.fileno())
+
+        # 获取底层 PTY 客户端
+        pty_client = self._claude._pty_client
+        if not pty_client:
+            print("错误：PTY 客户端未初始化")
+            return
+
+        master_fd = pty_client._master_fd
+
+        # 终端大小变化处理
+        def handle_sigwinch(signum, frame):
+            import shutil
+            try:
+                cols, rows = shutil.get_terminal_size()
+                pty_client.resize(rows, cols)
+            except Exception:
+                pass
+
+        old_sigwinch = signal.signal(signal.SIGWINCH, handle_sigwinch)
+
+        # 注册退出处理
+        def signal_handler(signum, frame):
+            raise KeyboardInterrupt()
+
+        old_sigint = signal.signal(signal.SIGINT, signal_handler)
+        old_sigterm = signal.signal(signal.SIGTERM, signal_handler)
+
+        try:
+            # 创建 stdin → PTY 和 PTY → stdout 的转发任务
+            async def forward_stdin_to_pty():
+                """将 stdin 转发到 PTY"""
+                loop = asyncio.get_event_loop()
+                reader = asyncio.StreamReader()
+                protocol = asyncio.StreamReaderProtocol(reader)
+                await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+
+                while self._running:
+                    try:
+                        data = await reader.read(1024)
+                        if not data:
+                            break
+                        os.write(master_fd, data)
+                    except Exception:
+                        break
+
+            async def forward_pty_to_stdout():
+                """将 PTY 输出转发到 stdout"""
+                loop = asyncio.get_event_loop()
+
+                while self._running:
+                    try:
+                        # 使用 select 检查是否有数据可读
+                        import select
+                        ready, _, _ = select.select([master_fd], [], [], 0.05)
+                        if ready:
+                            data = os.read(master_fd, 4096)
+                            if data:
+                                sys.stdout.buffer.write(data)
+                                sys.stdout.buffer.flush()
+                    except Exception:
+                        break
+
+            async def check_feishu_injection():
+                """检查飞书消息注入"""
+                while self._running:
+                    try:
+                        feishu_msg = await asyncio.wait_for(
+                            self._input_queue.get(),
+                            timeout=0.1
+                        )
+                        # 注入到 PTY
+                        os.write(master_fd, feishu_msg.encode() + b"\n")
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception:
+                        break
+
+            # 并行运行所有转发任务
+            await asyncio.gather(
+                forward_stdin_to_pty(),
+                forward_pty_to_stdout(),
+                check_feishu_injection(),
+                return_exceptions=True,
+            )
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # 恢复终端设置
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+
+            # 恢复信号处理
+            signal.signal(signal.SIGINT, old_sigint)
+            signal.signal(signal.SIGTERM, old_sigterm)
+            signal.signal(signal.SIGWINCH, old_sigwinch)
+
+            print("\n" + "-" * 60)
+
+    async def _run_print_mode(self):
+        """
+        Print 模式：使用 input 循环
+
+        每条消息启动一个独立的 claude --print 进程。
+        """
+        print("输入消息后按 Enter 发送，输入 /exit 退出")
+        print("飞书消息会自动注入到 CLI（同步模式下）")
+        print("-" * 60)
+
+        # 注册退出处理
+        def signal_handler(signum, frame):
+            print("\n\n正在退出...")
+            raise KeyboardInterrupt()
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        while self._running:
+            try:
+                # 优先检查飞书注入的消息
+                try:
+                    feishu_msg = self._input_queue.get_nowait()
+                    message = feishu_msg
+                    print(f"\n[飞书] {message}")
+                except asyncio.QueueEmpty:
+                    # 没有飞书消息，等待 CLI 输入
+                    message = input("\n你: ").strip()
+
+                if not message:
+                    continue
+
+                if message.lower() in ["/exit", "/quit", "exit", "quit"]:
+                    break
+
+                print("\nClaude: ", end="", flush=True)
+
+                # 发送消息（流式处理）
+                async for event in self._claude.chat_stream(message):
+                    if event.event_type == NativeEventType.CONTENT:
+                        # 内容片段
+                        print(event.data.get("text", ""), end="", flush=True)
+                    elif event.event_type == NativeEventType.TOOL_CALL:
+                        # 工具调用
+                        tool_name = event.data.get("name", "")
+                        print(f"\n[工具: {tool_name}]", flush=True)
+                    elif event.event_type == NativeEventType.PERMISSION_REQUEST:
+                        # 权限请求
+                        tool_name = event.data.get("tool_name", "")
+                        print(f"\n[权限请求] {tool_name} - 等待确认...", flush=True)
+                    elif event.event_type == NativeEventType.COMPLETE:
+                        # 完成
+                        new_session_id = event.data.get("session_id", "")
+                        if new_session_id:
+                            self.session_id = new_session_id
+                        cost = event.data.get("cost", 0)
+                        if cost:
+                            print(f"\n[Session: {self.session_id[:8] if self.session_id else 'N/A'}...] [Cost: ${cost:.4f}]")
+                    elif event.event_type == NativeEventType.ERROR:
+                        print(f"\n[错误] {event.data.get('message', '')}")
+
+                print()  # 换行
+
+            except KeyboardInterrupt:
+                break
+            except EOFError:
+                break
 
 
 async def main():
